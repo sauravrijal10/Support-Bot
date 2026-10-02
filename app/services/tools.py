@@ -50,13 +50,24 @@ class ToolContext:
 class SearchProductsArgs(BaseModel):
     query: str | None = Field(
         None,
-        description="1-3 keywords, e.g. 'storage' or 'backup drive'. Omit to list everything.",
+        description="1-3 keywords, e.g. 'hoodie', 'backup drive' or an author or brand. "
+        "Omit to list everything.",
+    )
+    category: str | None = Field(
+        None,
+        max_length=64,
+        description="Only this product type, e.g. 'books' or 'clothing' "
+        "(see list_product_types).",
     )
     max_price: float | None = Field(
         None, ge=0, description="Only products priced at or below this amount (USD)."
     )
     in_stock_only: bool = Field(False, description="Only products that can be bought right now.")
     limit: int = Field(10, ge=1, le=10, description="Maximum products to return.")
+
+
+class ListProductTypesArgs(BaseModel):
+    pass
 
 
 class GetOrderArgs(BaseModel):
@@ -131,6 +142,7 @@ def _search_products(ctx: ToolContext, args: SearchProductsArgs) -> dict:
     max_price = Decimal(str(args.max_price)) if args.max_price is not None else None
     rows, total = ctx.db.search_products(
         terms=search_terms(args.query),
+        category=(args.category or "").strip().lower() or None,
         max_price=max_price,
         in_stock_only=args.in_stock_only,
         limit=args.limit,
@@ -140,15 +152,34 @@ def _search_products(ctx: ToolContext, args: SearchProductsArgs) -> dict:
         item = {
             "sku": p["sku"],
             "name": p["name"],
+            "type": p["type"],
             "description": _short(p["description"]),
             "price": str(p["price"]),
             "billing_period": p["billing_period"],
             "availability": "out of stock" if p["stock_quantity"] == 0 else "in stock",
         }
+        if p["attributes"]:
+            item["details"] = {k: _short(str(v)) for k, v in p["attributes"].items()}
         if p["stock_quantity"] is not None:
             item["units_left"] = p["stock_quantity"]
         products.append(item)
     return {"total_matches": total, "shown": len(products), "products": products}
+
+
+def _list_product_types(ctx: ToolContext, args: ListProductTypesArgs) -> dict:
+    types = ctx.db.list_product_types()
+    return {
+        "product_types": [
+            {
+                "category": t["slug"],
+                "name": t["name"],
+                "description": _short(t["description"]),
+                "products": t["product_count"],
+                "details_listed": [a.get("label") or a["key"] for a in t["attribute_schema"]],
+            }
+            for t in types
+        ]
+    }
 
 
 def _get_order(ctx: ToolContext, args: GetOrderArgs) -> dict:
@@ -243,6 +274,15 @@ ALL_TOOLS: dict[str, Tool] = {
             "question about what is sold, what something costs, or whether it is in stock.",
             SearchProductsArgs,
             _search_products,
+            requires_login=False,
+        ),
+        Tool(
+            "list_product_types",
+            "List the store's product categories (e.g. books, clothing, electronics) with how "
+            "many products each has. Use for 'what do you sell?' questions, or to find the "
+            "category name to pass to search_products.",
+            ListProductTypesArgs,
+            _list_product_types,
             requires_login=False,
         ),
         Tool(

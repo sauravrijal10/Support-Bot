@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import auth, chat, chat_ws, health, web
 from app.api.views.orders import OrderView
+from app.api.views.product_types import ProductTypeView
 from app.api.views.products import ProductView
 from app.api.views.tickets import TicketView
 from app.config import get_settings
@@ -69,6 +70,7 @@ app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(chat_ws.router)
 app.include_router(web.router)
+app.include_router(ProductTypeView.as_router())
 app.include_router(ProductView.as_router())
 app.include_router(OrderView.as_router())
 app.include_router(TicketView.as_router())

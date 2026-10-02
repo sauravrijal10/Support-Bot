@@ -13,11 +13,13 @@ pass the *authenticated* customer's id, never one taken from question text.
 That is what stops one customer reading another's records.
 """
 
-from sqlalchemy import or_, select
+import sqlalchemy as sa
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Customer, Order, Product, Ticket
+from app.models import Customer, Order, Product, ProductType, Ticket
+from app.services.catalog import describe_attributes
 
 # Cap on rows fed into the model's context per list.
 MAX_ROWS = 20
@@ -115,24 +117,65 @@ class Database:
                 for t in tickets
             ]
 
-    def search_products(self, terms, max_price=None, in_stock_only=False, limit=10):
+    def list_product_types(self):
+        """Active product types with how many active products each has."""
+        with self._session_factory() as session:
+            count = (
+                select(func.count(Product.id))
+                .where(Product.product_type_id == ProductType.id, Product.is_active.is_(True))
+                .scalar_subquery()
+            )
+            rows = session.execute(
+                select(ProductType, count)
+                .where(ProductType.is_active.is_(True))
+                .order_by(ProductType.name)
+            ).all()
+            return [
+                {
+                    "slug": t.slug,
+                    "name": t.name,
+                    "description": t.description,
+                    "attribute_schema": t.attribute_schema,
+                    "product_count": n,
+                }
+                for t, n in rows
+            ]
+
+    def search_products(self, terms, category=None, max_price=None, in_stock_only=False, limit=10):
         """Active products only (public store data). `terms` are already
         cleaned keywords; a product matches if ANY term appears in its name,
-        description or SKU. No terms = every active product.
-        Returns (rows, total_matches), cheapest first."""
+        description, SKU, attribute values or type name, and products
+        matching MORE terms rank first (so "backup drive" finds the drive
+        before a plan that merely mentions backups), then cheapest first.
+        `category` restricts to one product type (slug or name).
+        Returns (rows, total_matches)."""
         with self._session_factory() as session:
-            stmt = select(Product).where(Product.is_active.is_(True))
+            stmt = (
+                select(Product)
+                .join(Product.product_type)
+                .where(Product.is_active.is_(True))
+            )
+            order = [Product.price, Product.name, Product.id]
             if terms:
+                attribute_text = sa.cast(Product.attributes, sa.Text)
+                matches = [
+                    or_(
+                        Product.name.icontains(t, autoescape=True),
+                        Product.description.icontains(t, autoescape=True),
+                        Product.sku.icontains(t, autoescape=True),
+                        attribute_text.icontains(t, autoescape=True),
+                        ProductType.name.icontains(t, autoescape=True),
+                    )
+                    for t in terms
+                ]
+                stmt = stmt.where(or_(*matches))
+                score = sum(sa.case((m, 1), else_=0) for m in matches)
+                order.insert(0, score.desc())
+            if category:
                 stmt = stmt.where(
                     or_(
-                        *[
-                            or_(
-                                Product.name.icontains(t, autoescape=True),
-                                Product.description.icontains(t, autoescape=True),
-                                Product.sku.icontains(t, autoescape=True),
-                            )
-                            for t in terms
-                        ]
+                        ProductType.slug.icontains(category, autoescape=True),
+                        ProductType.name.icontains(category, autoescape=True),
                     )
                 )
             if max_price is not None:
@@ -142,15 +185,15 @@ class Database:
                     or_(Product.stock_quantity.is_(None), Product.stock_quantity > 0)
                 )
 
-            total = len(session.scalars(stmt.with_only_columns(Product.id)).all())
-            products = session.scalars(
-                stmt.order_by(Product.price, Product.name, Product.id).limit(limit)
-            ).all()
+            total = session.scalar(stmt.with_only_columns(func.count(Product.id)))
+            products = session.scalars(stmt.order_by(*order).limit(limit)).all()
             rows = [
                 {
                     "sku": p.sku,
                     "name": p.name,
+                    "type": p.product_type.name,
                     "description": p.description,
+                    "attributes": describe_attributes(p.product_type.attribute_schema, p.attributes),
                     "price": p.price,
                     "billing_period": p.billing_period,
                     "stock_quantity": p.stock_quantity,

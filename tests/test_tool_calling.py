@@ -87,10 +87,18 @@ class FakeDB:
     def get_tickets_for_customer(self, customer_id, status=None, limit=20):
         return []
 
-    def search_products(self, terms, max_price=None, in_stock_only=False, limit=10):
-        self.product_searches.append({"terms": terms, "max_price": max_price, "in_stock_only": in_stock_only})
-        return [{"sku": "PLUS-PLAN", "name": "Plus plan", "description": "100GB", "price": Decimal("5.00"),
+    def search_products(self, terms, category=None, max_price=None, in_stock_only=False, limit=10):
+        self.product_searches.append(
+            {"terms": terms, "category": category, "max_price": max_price, "in_stock_only": in_stock_only}
+        )
+        return [{"sku": "PLUS-PLAN", "name": "Plus plan", "type": "Digital services", "description": "100GB",
+                 "attributes": {"Storage": "100 GB"}, "price": Decimal("5.00"),
                  "billing_period": "monthly", "stock_quantity": None}], 1
+
+    def list_product_types(self):
+        return [{"slug": "books", "name": "Books", "description": "Printed books and e-books.",
+                 "attribute_schema": [{"key": "author", "label": "Author"}, {"key": "format"}],
+                 "product_count": 4}]
 
 
 def ask(llm, query="What is the status of order 8?", customer=ADA, db=None):
@@ -152,7 +160,7 @@ def test_someone_elses_order_looks_identical_to_a_nonexistent_one():
 def test_signed_out_callers_are_offered_only_public_tools():
     llm = FakeLLM(reply("We sell plans."))
     ask(llm, "What plans do you sell?", customer=None)
-    assert llm.requests[0][1] == ["search_products"]
+    assert llm.requests[0][1] == ["search_products", "list_product_types"]
 
 
 def test_signed_in_callers_are_offered_all_tools():
@@ -236,7 +244,30 @@ def test_empty_model_reply_gets_a_safe_fallback():
 def test_product_search_receives_cleaned_terms_and_a_decimal_price():
     llm = FakeLLM(reply(calls=[tool_call("search_products", '{"query": "Plans under 10 dollars", "max_price": 10}')]), reply("ok"))
     _, db = ask(llm, "any plan under $10?", customer=None)
-    assert db.product_searches == [{"terms": ["plan"], "max_price": Decimal("10.0"), "in_stock_only": False}]
+    assert db.product_searches == [
+        {"terms": ["plan"], "category": None, "max_price": Decimal("10.0"), "in_stock_only": False}
+    ]
+
+
+def test_product_search_passes_a_normalised_category_and_shows_type_and_details():
+    llm = FakeLLM(reply(calls=[tool_call("search_products", '{"category": "  Books "}')]), reply("ok"))
+    _, db = ask(llm, "what books do you have?", customer=None)
+    assert db.product_searches[0]["category"] == "books"
+
+    result = json.loads(llm.requests[1][0][-1]["content"])["products"][0]
+    assert result["type"] == "Digital services"
+    assert result["details"] == {"Storage": "100 GB"}
+
+
+def test_list_product_types_is_public_and_shows_categories():
+    llm = FakeLLM(reply(calls=[tool_call("list_product_types", "{}")]), reply("We sell books."))
+    result, _ = ask(llm, "what do you sell?", customer=None)
+    content = json.loads(llm.requests[1][0][-1]["content"])
+    assert content["product_types"] == [
+        {"category": "books", "name": "Books", "description": "Printed books and e-books.",
+         "products": 4, "details_listed": ["Author", "format"]}
+    ]
+    assert result.tools_used == ["list_product_types"]
 
 
 # ---------------------------------------------------------------- the tools

@@ -28,12 +28,13 @@ MAX_TOOL_STEPS = 4  # model round-trips that may request tools
 MAX_CALLS_PER_STEP = 3  # tool calls honoured in a single round-trip
 MAX_HISTORY_TURNS = 6  # earlier question/answer pairs given to the model
 
-SYSTEM_PROMPT = """You are a support assistant for Acme Cloud Storage.
+SYSTEM_PROMPT = """You are a support assistant for Acme Store, an online shop selling products
+across several categories, including the Acme Cloud Storage plans.
 
 You have tools that look up live data. Rules:
-- For anything about products, prices, availability, orders or tickets, call the
-  matching tool. Never answer those from memory and never guess: if you have not
-  called a tool, you do not have that data.
+- For anything about products, product categories, prices, availability, orders or
+  tickets, call the matching tool. Never answer those from memory and never guess:
+  if you have not called a tool, you do not have that data.
 - For policies and how-to questions, use the FAQ documentation below.
 - If the FAQ and a tool result disagree about a price or availability, the tool
   result is correct.
@@ -52,7 +53,7 @@ You have tools that look up live data. Rules:
 LOGIN_REQUIRED_MESSAGE = (
     "I can help with questions about your account, orders and tickets once "
     "you're signed in. Please log in and ask again -- I can still answer "
-    "general questions about Acme Cloud Storage without signing in."
+    "general questions about Acme Store without signing in."
 )
 
 EMPTY_ANSWER_MESSAGE = (
