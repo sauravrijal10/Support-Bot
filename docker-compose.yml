@@ -1,0 +1,48 @@
+services:
+  db:
+    # pgvector's own image: postgres:16 with the pgvector extension
+    # precompiled, needed for semantic search over the FAQ docs.
+    image: pgvector/pgvector:pg16
+    # Dev-only credentials for the local compose network -- fine here
+    # since the db isn't exposed to the host or the internet. Use real
+    # secrets (e.g. a .env-sourced password) before deploying anywhere.
+    environment:
+      POSTGRES_USER: supportbot
+      POSTGRES_PASSWORD: supportbot
+      POSTGRES_DB: supportbot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No host port published -- the "app" service reaches this over the
+    # compose network as "db:5432". Uncomment below to also inspect it
+    # from the host (pick a free port; this machine runs many other
+    # Postgres containers so 5432/5433/5434 etc. may already be taken):
+    # ports:
+    #   - "5555:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supportbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Talks to the "db" service directly over the compose network --
+      # this takes precedence over any DATABASE_URL in .env.
+      DATABASE_URL: postgresql://supportbot:supportbot@db:5432/supportbot
+    env_file:
+      - .env
+    ports:
+      # Host port 8020 since 8000 is already taken by another project on
+      # this machine -- change the left-hand side if 8020 is busy too.
+      - "8020:8000"
+    volumes:
+      # Live-reloads on code changes during development (uvicorn --reload
+      # in the Dockerfile). Drop this and --reload for a production image.
+      - .:/app
+
+volumes:
+  pgdata:

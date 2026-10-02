@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acme Support Chat</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
+    --border: #e1e4ea; --accent: #2f6fed; --accent-text: #ffffff;
+    --bot: #eef1f6; --chip: #e6ecfb; --chip-text: #2b4fa8;
+    --ok: #1f9d55; --warn: #d97706; --bad: #d64545;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1a1e26; --text: #e6e9ef; --muted: #8d95a7;
+      --border: #2a303c; --accent: #4f86f7; --accent-text: #ffffff;
+      --bot: #232934; --chip: #263453; --chip-text: #a9c1f5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    height: 100vh; height: 100dvh; display: flex; justify-content: center;
+  }
+  .app {
+    width: 100%; max-width: 820px; display: flex; flex-direction: column;
+    background: var(--panel); border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 17px; margin: 0; flex: 1; min-width: 140px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; color: var(--muted); padding: 6px 10px; }
+  .seg button.active { background: var(--accent); color: var(--accent-text); }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+
+  .account {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 14px;
+  }
+  .account form { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+  .account input { flex: 1 1 150px; min-width: 0; }
+  .account .who { flex: 1; }
+  .linkish { background: none; border: 0; color: var(--accent); padding: 0; cursor: pointer; font: inherit; }
+
+  input, textarea, button { font: inherit; color: inherit; }
+  input, textarea {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    border: 1px solid var(--border); background: var(--panel); border-radius: 8px;
+    padding: 8px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 85%; display: flex; flex-direction: column; gap: 4px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .bubble { padding: 9px 13px; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .user .bubble { background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
+  .bot .bubble { background: var(--bot); border-bottom-left-radius: 4px; }
+  .system { align-self: center; max-width: 100%; font-size: 13px; color: var(--muted); text-align: center; }
+  .system.error { color: var(--bad); }
+  .meta { display: flex; flex-wrap: wrap; gap: 5px; font-size: 12px; }
+  .chip { background: var(--chip); color: var(--chip-text); border-radius: 999px; padding: 1px 8px; }
+  .typing .bubble { color: var(--muted); }
+  .typing .bubble::after { content: "…"; animation: blink 1s steps(3) infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  .empty { margin: auto; text-align: center; color: var(--muted); max-width: 420px; }
+  .suggest { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 10px; }
+  .suggest button { font-size: 13px; padding: 5px 10px; border-radius: 999px; }
+
+  #composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+  #composer textarea { flex: 1; resize: none; height: 44px; max-height: 140px; min-width: 0; }
+  @media (max-width: 520px) {
+    .app { border: 0; }
+    .msg { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Acme Support</h1>
+    <div class="seg" role="group" aria-label="Transport">
+      <button type="button" data-mode="ws" title="Stateful conversation over /ws/chat">WebSocket</button>
+      <button type="button" data-mode="rest" title="One POST /chat call per question">REST</button>
+    </div>
+    <span class="status"><span class="dot" id="dot"></span><span id="status-text">—</span></span>
+    <button type="button" id="new-chat">New chat</button>
+  </header>
+
+  <section class="account" id="account"></section>
+
+  <main id="log" aria-live="polite"></main>
+
+  <form id="composer" autocomplete="off">
+    <textarea id="question" placeholder="Ask a question…" maxlength="2000" rows="1" required></textarea>
+    <button class="primary" id="send" type="submit">Send</button>
+  </form>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const SUGGESTIONS = [
+    "What plans do you offer?",
+    "How do I reset my password?",
+    "Do you sell a backup drive and how many are in stock?",
+    "What have I ordered?",
+  ];
+  const MAX_HISTORY = 6; // turns sent with each REST call (server caps it too)
+
+  const $ = (id) => document.getElementById(id);
+  const log = $("log"), questionEl = $("question"), sendBtn = $("send");
+
+  const store = {
+    get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
+    set(key, value) {
+      try { value == null ? sessionStorage.removeItem(key) : sessionStorage.setItem(key, value); } catch {}
+    },
+  };
+
+  const state = {
+    mode: store.get("mode") === "rest" ? "rest" : "ws",
+    token: store.get("token"),
+    customer: null,
+    history: [],      // REST mode only; the WebSocket server keeps its own
+    busy: false,
+    ws: null,
+    wsReady: false,
+    retry: 0,
+    retryTimer: null,
+  };
+
+  // ------------------------------------------------------------- rendering
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function scrollDown() { log.scrollTop = log.scrollHeight; }
+
+  function clearEmpty() { const e = log.querySelector(".empty"); if (e) e.remove(); }
+
+  function showEmpty() {
+    log.replaceChildren();
+    const box = el("div", "empty");
+    box.append(el("p", null, "Ask about plans, policies, products — or sign in to ask about your own orders and tickets."));
+    const row = el("div", "suggest");
+    for (const s of SUGGESTIONS) {
+      const b = el("button", null, s);
+      b.type = "button";
+      b.onclick = () => ask(s);
+      row.append(b);
+    }
+    box.append(row);
+    log.append(box);
+  }
+
+  function addUser(text) {
+    clearEmpty();
+    const m = el("div", "msg user");
+    m.append(el("div", "bubble", text));
+    log.append(m); scrollDown();
+  }
+
+  function addBot(data) {
+    clearEmpty();
+    const m = el("div", "msg bot");
+    m.append(el("div", "bubble", data.answer));
+    const meta = el("div", "meta");
+    for (const s of data.sources || []) meta.append(el("span", "chip", "📄 " + s));
+    for (const t of data.tools_used || []) meta.append(el("span", "chip", "🔧 " + t));
+    if (data.needs_authentication) {
+      const b = el("button", "linkish", "Sign in to continue");
+      b.type = "button";
+      b.onclick = () => { const i = document.querySelector("#account input"); if (i) i.focus(); };
+      meta.append(b);
+    }
+    if (meta.childElementCount) m.append(meta);
+    log.append(m); scrollDown();
+  }
+
+  function addSystem(text, isError) {
+    clearEmpty();
+    log.append(el("div", "system" + (isError ? " error" : ""), text));
+    scrollDown();
+  }
+
+  function setTyping(on) {
+    const existing = log.querySelector(".typing");
+    if (on && !existing) {
+      const m = el("div", "msg bot typing");
+      m.append(el("div", "bubble", "Thinking"));
+      log.append(m); scrollDown();
+    } else if (!on && existing) existing.remove();
+  }
+
+  function setBusy(on) {
+    state.busy = on;
+    setTyping(on);
+    updateComposer();
+  }
+
+  function updateComposer() {
+    const offline = state.mode === "ws" && !state.wsReady;
+    sendBtn.disabled = state.busy || offline;
+  }
+
+  function setStatus(kind, text) {
+    $("dot").className = "dot " + kind;
+    $("status-text").textContent = text;
+    updateComposer();
+  }
+
+  function renderModeButtons() {
+    for (const b of document.querySelectorAll("[data-mode]")) {
+      b.classList.toggle("active", b.dataset.mode === state.mode);
+    }
+  }
+
+  function renderAccount() {
+    const box = $("account");
+    box.replaceChildren();
+    if (state.customer) {
+      const who = el("span", "who");
+      who.append("Signed in as ", el("strong", null, state.customer.name), ` (${state.customer.plan})`);
+      const out = el("button", null, "Sign out");
+      out.type = "button";
+      out.onclick = signOut;
+      box.append(who, out);
+      return;
+    }
+
+    let registering = false;
+    const form = el("form");
+    const name = el("input"); name.placeholder = "Name"; name.autocomplete = "name"; name.hidden = true;
+    const email = el("input"); email.type = "email"; email.placeholder = "Email"; email.required = true; email.autocomplete = "username";
+    const pass = el("input"); pass.type = "password"; pass.placeholder = "Password"; pass.required = true; pass.autocomplete = "current-password";
+    const submit = el("button", "primary", "Sign in"); submit.type = "submit";
+    const toggle = el("button", "linkish", "Create account"); toggle.type = "button";
+    toggle.onclick = () => {
+      registering = !registering;
+      name.hidden = !registering; name.required = registering;
+      pass.autocomplete = registering ? "new-password" : "current-password";
+      submit.textContent = registering ? "Create account" : "Sign in";
+      toggle.textContent = registering ? "I have an account" : "Create account";
+    };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      submit.disabled = true;
+      try {
+        if (registering) await register(name.value, email.value, pass.value);
+        await signIn(email.value, pass.value);
+      } catch (err) {
+        addSystem(err.message, true);
+      } finally {
+        submit.disabled = false;
+      }
+    };
+    form.append(name, email, pass, submit, toggle);
+    box.append(form);
+  }
+
+  // ------------------------------------------------------------- HTTP API
+
+  async function api(path, options = {}) {
+    const headers = { ...(options.headers || {}) };
+    if (state.token && options.auth !== false) headers.Authorization = "Bearer " + state.token;
+    const res = await fetch(path, { ...options, headers });
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) {
+      const detail = body && body.detail;
+      const message = typeof detail === "string" ? detail
+        : Array.isArray(detail) ? detail.map((d) => d.msg).join("; ")
+        : `Request failed (${res.status})`;
+      const error = new Error(message);
+      error.status = res.status;
+      throw error;
+    }
+    return body;
+  }
+
+  async function register(name, email, password) {
+    await api("/auth/register", {
+      method: "POST", auth: false,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, email, password }),
+    });
+    addSystem("Account created.");
+  }
+
+  async function signIn(email, password) {
+    const form = new URLSearchParams({ username: email, password });
+    const data = await api("/auth/login", { method: "POST", auth: false, body: form });
+    await adoptToken(data.access_token);
+  }
+
+  async function adoptToken(token) {
+    state.token = token;
+    const customer = await api("/auth/me");
+    state.customer = customer;
+    store.set("token", token);
+    startNewChat(false);
+    renderAccount();
+    if (state.mode === "ws") wsSend({ type: "auth", token });
+    addSystem(`Signed in as ${customer.name}. New conversation started.`);
+  }
+
+  function signOut(reason) {
+    const wasSignedIn = !!state.customer;
+    state.token = null; state.customer = null;
+    store.set("token", null);
+    startNewChat(false);
+    renderAccount();
+    if (state.mode === "ws") wsSend({ type: "auth", token: null });
+    if (wasSignedIn) addSystem(typeof reason === "string" ? reason : "Signed out.");
+  }
+
+  async function askRest(question) {
+    try {
+      const data = await api("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, history: state.history.slice(-MAX_HISTORY) }),
+      });
+      state.history.push({ question, answer: data.answer });
+      addBot(data);
+    } catch (err) {
+      if (err.status === 401) signOut("Your session expired. Please sign in again.");
+      else addSystem(err.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ------------------------------------------------------------- WebSocket
+
+  function wsUrl() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}/ws/chat`;
+  }
+
+  function wsSend(frame) {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(frame));
+  }
+
+  function wsConnect() {
+    clearTimeout(state.retryTimer);
+    if (state.ws) return;
+    setStatus("warn", "Connecting…");
+    const ws = new WebSocket(wsUrl());
+    state.ws = ws;
+
+    ws.onopen = () => { state.retry = 0; };
+
+    ws.onmessage = (event) => {
+      let frame;
+      try { frame = JSON.parse(event.data); } catch { return; }
+      switch (frame.type) {
+        case "ready":
+          // A fresh connection is anonymous with no history: re-identify.
+          if (state.token) wsSend({ type: "auth", token: state.token });
+          state.wsReady = true;
+          setStatus("ok", "Connected");
+          break;
+        case "auth_ok":
+          break;
+        case "typing":
+          setTyping(true);
+          break;
+        case "answer":
+          setBusy(false);
+          addBot(frame);
+          break;
+        case "error":
+          setBusy(false);
+          if (frame.code === "unauthorized") signOut("Your session expired. Please sign in again.");
+          else addSystem(frame.detail || "Something went wrong.", true);
+          break;
+      }
+    };
+
+    ws.onclose = () => {
+      if (state.ws !== ws) return;
+      state.ws = null; state.wsReady = false;
+      if (state.busy) { setBusy(false); addSystem("Connection lost before an answer arrived.", true); }
+      if (state.mode !== "ws") return;
+      const delay = Math.min(30000, 1000 * 2 ** state.retry++);
+      setStatus("bad", `Disconnected — retrying in ${Math.round(delay / 1000)}s`);
+      state.retryTimer = setTimeout(wsConnect, delay);
+    };
+  }
+
+  function wsDisconnect() {
+    clearTimeout(state.retryTimer);
+    const ws = state.ws;
+    state.ws = null; state.wsReady = false;
+    if (ws) ws.close();
+  }
+
+  // ------------------------------------------------------------- actions
+
+  function ask(text) {
+    const question = text.trim();
+    if (!question || state.busy) return;
+    if (state.mode === "ws" && !state.wsReady) return;
+    addUser(question);
+    setBusy(true);
+    if (state.mode === "ws") wsSend({ type: "message", question });
+    else askRest(question);
+  }
+
+  function startNewChat(notify = true) {
+    state.history = [];
+    if (state.mode === "ws") wsSend({ type: "reset" });
+    showEmpty();
+    if (notify) questionEl.focus();
+  }
+
+  function setMode(mode) {
+    if (mode === state.mode) return;
+    state.mode = mode;
+    store.set("mode", mode);
+    renderModeButtons();
+    setBusy(false);
+    if (mode === "ws") {
+      wsConnect();
+    } else {
+      wsDisconnect();
+      setStatus("ok", "REST");
+    }
+    startNewChat();
+    addSystem(mode === "ws"
+      ? "Using WebSocket /ws/chat — the server remembers this conversation."
+      : "Using REST POST /chat — each call carries the recent history.");
+  }
+
+  // ------------------------------------------------------------- wiring
+
+  $("composer").onsubmit = (e) => {
+    e.preventDefault();
+    const text = questionEl.value;
+    if (!text.trim() || sendBtn.disabled) return;
+    questionEl.value = "";
+    ask(text);
+  };
+  questionEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("composer").requestSubmit(); }
+  });
+  $("new-chat").onclick = () => startNewChat();
+  for (const b of document.querySelectorAll("[data-mode]")) b.onclick = () => setMode(b.dataset.mode);
+
+  async function init() {
+    renderModeButtons();
+    showEmpty();
+    if (state.token) {
+      try {
+        state.customer = await api("/auth/me");
+      } catch {
+        state.token = null;
+        store.set("token", null);
+      }
+    }
+    renderAccount();
+    if (state.mode === "ws") wsConnect();
+    else setStatus("ok", "REST");
+    questionEl.focus();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
