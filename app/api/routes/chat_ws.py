@@ -16,7 +16,8 @@ Protocol (JSON text frames):
     {"type": "ready", "customer": null}
     {"type": "auth_ok", "customer": {...} | null}
     {"type": "typing"}                      an answer is being prepared
-    {"type": "answer", "answer", "sources", "needs_authentication", "tools_used"}
+    {"type": "answer", "answer", "sources", "needs_authentication", "tools_used",
+     "order_form"}                           (same fields as POST /chat)
     {"type": "reset_ok"} / {"type": "pong"}
     {"type": "error", "code", "detail"}
 
@@ -121,6 +122,7 @@ class Conversation:
             sources=result.sources,
             needs_authentication=result.needs_authentication,
             tools_used=result.tools_used,
+            order_form=result.order_form,
         )
         await self.send("answer", **response.model_dump())
 

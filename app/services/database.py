@@ -19,7 +19,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Customer, Order, Product, ProductType, Ticket
+from app.services import variants as variant_rules
 from app.services.catalog import describe_attributes
+from app.services.order_cancellations import confirm_cancellation, request_cancellation
+from app.services.order_drafts import confirm_draft, prepare_draft
 
 # Cap on rows fed into the model's context per list.
 MAX_ROWS = 20
@@ -158,12 +161,14 @@ class Database:
             order = [Product.price, Product.name, Product.id]
             if terms:
                 attribute_text = sa.cast(Product.attributes, sa.Text)
+                variant_text = sa.cast(Product.variants, sa.Text)
                 matches = [
                     or_(
                         Product.name.icontains(t, autoescape=True),
                         Product.description.icontains(t, autoescape=True),
                         Product.sku.icontains(t, autoescape=True),
                         attribute_text.icontains(t, autoescape=True),
+                        variant_text.icontains(t, autoescape=True),
                         ProductType.name.icontains(t, autoescape=True),
                     )
                     for t in terms
@@ -181,9 +186,7 @@ class Database:
             if max_price is not None:
                 stmt = stmt.where(Product.price <= max_price)
             if in_stock_only:
-                stmt = stmt.where(
-                    or_(Product.stock_quantity.is_(None), Product.stock_quantity > 0)
-                )
+                stmt = stmt.where(variant_rules.in_stock_clause())
 
             total = session.scalar(stmt.with_only_columns(func.count(Product.id)))
             products = session.scalars(stmt.order_by(*order).limit(limit)).all()
@@ -197,7 +200,47 @@ class Database:
                     "price": p.price,
                     "billing_period": p.billing_period,
                     "stock_quantity": p.stock_quantity,
+                    "variants": [
+                        {
+                            "sku": v["sku"],
+                            "options": variant_rules.label(p, v),
+                            "price": variant_rules.unit_price(p, v),
+                            "stock_quantity": variant_rules.stock_of(p, v),
+                        }
+                        for _, v in variant_rules.sellable_items(p) if v is not None
+                    ],
                 }
                 for p in products
             ]
+            for row in rows:
+                stocks = [v["stock_quantity"] for v in row["variants"]] or [row["stock_quantity"]]
+                row["available"] = any(s is None or s > 0 for s in stocks)
             return rows, total
+
+    def prepare_order_draft(self, customer_id, lines, now):
+        """Quote an order for the customer (see order_drafts.prepare_draft)."""
+        with self._session_factory() as session:
+            result = prepare_draft(session, customer_id, lines, now)
+            session.commit()
+            return result
+
+    def confirm_order_draft(self, customer_id, request_started_at, now):
+        """Place the customer's open draft (see order_drafts.confirm_draft)."""
+        with self._session_factory() as session:
+            result = confirm_draft(session, customer_id, request_started_at, now)
+            session.commit()
+            return result
+
+    def request_order_cancellation(self, customer_id, order_id, now):
+        """Ask to cancel one of the customer's orders (see order_cancellations)."""
+        with self._session_factory() as session:
+            result = request_cancellation(session, customer_id, order_id, now)
+            session.commit()
+            return result
+
+    def confirm_order_cancellation(self, customer_id, request_started_at, now):
+        """Cancel the order the customer was asked about (see order_cancellations)."""
+        with self._session_factory() as session:
+            result = confirm_cancellation(session, customer_id, request_started_at, now)
+            session.commit()
+            return result

@@ -26,6 +26,32 @@ class ChatRequest(BaseModel):
     )
 
 
+class OrderFormOption(BaseModel):
+    sku: str
+    name: str
+    unit_price: str
+    billing_period: str
+    max_quantity: int = Field(
+        description="Most that can be ordered (stock or the per-order cap); 0 = sold out"
+    )
+
+
+class OrderFormLine(BaseModel):
+    sku: str = Field(description="The option currently selected")
+    quantity: int
+    options: list[OrderFormOption] = Field(description="The product's variants, cheapest first")
+
+
+class OrderForm(BaseModel):
+    """An order the assistant prepared. Show it as a form (option, quantity,
+    live total), then POST /orders/drafts/{draft_id}/confirm or /discard."""
+
+    draft_id: int
+    lines: list[OrderFormLine]
+    total: str
+    expires_at: str
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[str] = []
@@ -39,6 +65,9 @@ class ChatResponse(BaseModel):
     tools_used: list[str] = Field(
         default_factory=list,
         description="Names of the lookup tools the assistant called to answer (for transparency).",
+    )
+    order_form: OrderForm | None = Field(
+        default=None, description="Present when the assistant prepared an order to confirm."
     )
 
 

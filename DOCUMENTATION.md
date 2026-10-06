@@ -1,28 +1,32 @@
-# Support Bot — Project Documentation
+# Digi Store Support Platform — Project Documentation
 
 A record of everything built so far: what the system does, how it is put together, the order in which it was built, the problems hit along the way, and what is still open.
+
+For the choice of each technology and the alternatives considered, see [TECH_STACK.md](TECH_STACK.md); for setup and API examples, see [README.md](README.md).
 
 ---
 
 ## 1. Overview
 
-The Support Bot is a customer-support assistant for a fictional product, **Acme Cloud Storage**, exposed as an authenticated HTTP API. It has two halves:
+The platform is an online shop back-end with an AI support assistant, for a fictional store, **Digi Store**. It sells products across several categories (electronics, clothing, books, home & kitchen, gift cards, and the **Acme Cloud Storage** subscription plans). It has three parts:
 
-- **A store back-end** — REST resources for **products, orders (with line items) and tickets**, stored in Postgres, with customer/admin access control.
-- **An agentic chatbot** — for each question, the model decides for itself what data it needs and requests it through **tool calling**: read-only tools that search the live product catalog or look up the signed-in customer's own orders and tickets. FAQ text (policies, how-tos) is still retrieved up front by semantic search, since it's cheap, local, and doesn't need a tool round-trip.
+- **A store back-end** — REST resources for **product types, products (with variants), orders (with line items) and tickets**, stored in PostgreSQL, with customer/admin access control.
+- **An agentic support assistant** — for each message, the language model decides what it needs and requests it through **tool calling**: searching the live catalog, looking up the signed-in customer's own orders and tickets, and — in two confirmed steps — **placing and cancelling orders**. Policy and how-to answers come from an FAQ, retrieved by semantic search.
+- **Chat channels** — a stateless REST endpoint, a stateful **WebSocket**, and a **web chat page** that shows an interactive **order form** (pick a variant, set a quantity, see the total, confirm).
 
-The model never touches the database and never writes SQL. Every tool call runs a fixed, parameterised query scoped to the *authenticated* customer, never to an id the model supplies. Signed-out callers can ask general and product questions; anything needing account data requires a login.
+The model never touches the database and never writes SQL. Every tool runs a fixed, parameterised query scoped to the *authenticated* customer, never to an id the model supplies. The only actions that change data — ordering and cancelling — require a confirmation that the **server** checks, not just the model.
 
 | Layer | Technology |
 |---|---|
-| API | FastAPI + Uvicorn; **class-based views** for the store resources |
-| ORM / migrations | SQLAlchemy 2.0 models, Alembic migrations |
-| Authentication | Argon2 password hashing, JWT (HS256) bearer tokens, OAuth2 password flow, admin role |
-| LLM | `Qwen/Qwen2.5-72B-Instruct` (pinned to the `deepinfra` provider) via Hugging Face Inference Providers — **billed**, not free |
-| Agent behaviour | Tool calling (`app/services/tools.py`), 1–4 model round-trips per question |
+| API | FastAPI + Uvicorn; class-based views for store resources; WebSocket chat |
+| Web UI | Single-file HTML/JavaScript chat page served at `/` |
+| ORM / migrations | SQLAlchemy 2.0 models (psycopg2 driver), Alembic migrations 0001–0006 |
+| Authentication | Argon2id password hashing, JWT (HS256) bearer tokens, OAuth2 password flow, admin role |
+| LLM | `Qwen/Qwen2.5-72B-Instruct` (pinned to `deepinfra`) via Hugging Face Inference Providers — **billed**, with multi-token failover |
+| Agent behaviour | Tool calling (`app/services/tools.py`): 9 tools, 1–4 model round-trips per message |
 | Embeddings | `BAAI/bge-small-en-v1.5` via `fastembed` (local, ONNX, 384 dims) |
-| Database | PostgreSQL 16 with the `pgvector` extension |
-| Testing | pytest, a scripted fake LLM (no network/credits needed) |
+| Database | PostgreSQL 16 with `pgvector`; JSONB for per-type attributes, variants and order drafts |
+| Testing | pytest: scripted fake LLM + tests against a real, rolled-back Postgres (203 tests) |
 | Packaging | Docker + Docker Compose |
 
 ---
@@ -32,7 +36,7 @@ The model never touches the database and never writes SQL. Every tool call runs 
 | # | Task | Outcome |
 |---|---|---|
 | 1 | **Project structure cleanup** | `chat.py` was misplaced in a stray `chunks/` folder; moved to the root. Created a `.venv`. |
-| 2 | **Switch from Anthropic to a free open model** | Replaced the Anthropic SDK with `huggingface_hub`'s `InferenceClient`. Auth moved to `HF_TOKEN`. (Later corrected: see #12 — no provider on the router is actually free.) |
+| 2 | **Switch from Anthropic to an open model** | Replaced the Anthropic SDK with `huggingface_hub`'s `InferenceClient`. Auth moved to `HF_TOKEN`. (Later corrected: see #12 — no provider on the router is actually free.) |
 | 3 | **Secrets handling** | `python-dotenv`, `.env` / `.env.example`, `.gitignore`. |
 | 4 | **Fix HF 403** | Token lacked the *"Make calls to Inference Providers"* scope. |
 | 5 | **Fix HF 400 (`model_not_supported`)** | Switched from Qwen2.5-7B to `microsoft/phi-4` after checking the live router model list. |
@@ -41,66 +45,79 @@ The model never touches the database and never writes SQL. Every tool call runs 
 | 8 | **FastAPI restructure + API endpoint** | Replaced the terminal loop with `POST /chat`; `app/api`, `app/schemas`, `app/services` layout. |
 | 9 | **pgvector semantic retrieval** | Replaced TF-IDF with embedding search in Postgres. |
 | 10 | **Authentication** | Login/registration, JWT tokens, argon2, per-customer data scoping. |
-| 11 | **Models, class-based views, and DB-backed answers** | SQLAlchemy models + Alembic migrations; products / orders / tickets REST resources as class-based views with role-based access; chat answers now come from the live `products` catalog and the customer's real orders. Replaced `schema.sql` and the raw-SQL data layer. **Breaking schema change** — see §6. |
-| 12 | **Tool calling** | Replaced the fixed "always fetch the catalog + customer data" design with a model-driven tool-calling loop. Required switching models (`phi-4` cannot do tool calling — see §11) to `Qwen2.5-72B-Instruct`. Corrected a standing inaccuracy in this project's own docs: **no Hugging Face router provider is actually free**; the LLM is billed per token. Added the first automated test suite (pytest, against a scripted fake model). **Breaking API change** — see §7.3. |
+| 11 | **Models, class-based views, DB-backed answers** | SQLAlchemy models + Alembic; products / orders / tickets as class-based views with role-based access. Replaced `schema.sql` and the raw-SQL data layer. **Breaking schema change** — see §6. |
+| 12 | **Tool calling** | Replaced "always fetch everything" with a model-driven tool-calling loop. Required switching models (`phi-4` cannot call tools — §11) to `Qwen2.5-72B-Instruct`. Corrected the project's own docs: the LLM is billed, not free. First automated tests (fake LLM). |
+| 13 | **WebSocket chat + web interface** | `WS /ws/chat` (one connection = one conversation, server-side history, token sent in a frame and re-checked per message); a browser chat page at `/` using only the public API, switchable between WebSocket and REST. |
+| 14 | **Conversation history** | `answer_question` accepts earlier turns (last 6); `POST /chat` takes an optional `history`. FAQ context moved into the system message so follow-ups ("how much is it?") resolve correctly. |
+| 15 | **SQLAlchemy 2.1 driver fix** | A rebuild pulled SQLAlchemy 2.1, whose default `postgresql://` driver is psycopg 3 (not installed); the app stopped starting. `sqlalchemy_url()` now names `psycopg2` explicitly. |
+| 16 | **E-commerce: product types** | `product_types` table with per-type attribute definitions (JSONB); products carry validated `attributes`; `/product-types` endpoints; seed catalog of 6 types and 30 products. Product search ranks by number of matching terms. |
+| 17 | **FAQ rewritten for e-commerce** | 20 sections: ordering, statuses, cancellation, stock, payment, shipping, digital delivery, returns, refunds, sizing, warranty, gift cards, accounts, support, cloud plans. No prices or stock in the FAQ — those come only from the live catalog. |
+| 18 | **Rename to Digi Store** | Store name and support email (`support@digistore.example`) across the prompt, FAQ, UI and docs; product brands unchanged. |
+| 19 | **Ordering by chat** | `prepare_order` / `confirm_order` tools; quotes stored in `order_drafts`; server refuses to confirm unless quoted in an earlier message, the latest message is a clear yes, it's < 15 min old and the total is unchanged. |
+| 20 | **Cancelling by chat** | `request_cancellation` / `confirm_cancellation`, same two-step protection; `cancellation_requests` table; only the customer's own pending orders, even for admins. |
+| 21 | **HF token failover + error logging** | `HF_FALLBACK_TOKENS`: on 401/402/403/429 the request moves to the next token and the failed one is skipped for a while. Provider errors are logged (customers still see a generic 503). |
+| 22 | **Order form** | Chat answers carry an `order_form` (variants, prices, stock caps); the web page renders it with a live total; `POST /orders/drafts/{id}/confirm` places the order only if the total shown is still correct. |
+| 23 | **Product variants (JSONB)** | `products.variants` (SKU, options, optional price, stock, active flag per variant); variant-flagged attributes on types; variant-aware ordering, stock, cancelling, search and order form; seed converted per-size products into variants. |
+| 24 | **Technology documentation** | `TECH_STACK.md` rewritten: role, significance and reasons for each technology over its alternatives. |
 
 ---
 
 ## 3. Architecture
 
 ```
-        POST /chat  { question }   [+ Authorization: Bearer <jwt>]
-                              │
-                              ▼
-                   app/api/routes/chat.py
-        (api/deps.py: token → customer, or None; bad token → 401)
-                              │
-                              ▼
-                app/services/chat_service.answer_question()
-                              │
-        signed out + account-type question?  ──yes──▶  "please log in"
-                              │ no                     (no model call)
-                              ▼
-              vector_knowledge_base.retrieve()   (FAQ chunks, always -- cheap, local)
-                              │
-                              ▼
-              ┌─────────────────────────────────────────────┐
-              │  TOOL-CALLING LOOP (≤ MAX_TOOL_STEPS rounds) │
-              │  tools offered = tools_for(customer)         │
-              │                                              │
-              │   llm.complete(messages, tools) ──tool_calls?│
-              │       ▲                    │ yes             │
-              │       │                    ▼                 │
-              │       │        run_tool(name, args, ctx)      │
-              │       │        ctx.customer = the AUTHENTICATED│
-              │       │        customer -- never an id from   │
-              │       │        the model's own arguments       │
-              │       │                    │                  │
-              │       └── append result, loop back ───────────┘
-              │                    │ no tool_calls
-              │                    ▼
-              │              done: answer text
-              └─────────────────────────────────────────────┘
-                              ▼
-       { answer, sources, needs_authentication, tools_used }
+  Web chat page (/)   or any client
+     │  REST:      POST /chat {question, history}
+     │  WebSocket: /ws/chat  (auth / message / reset frames)
+     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ api/deps.py: bearer token -> customer  (none -> anonymous; invalid -> 401)   │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─ chat service ───────────────────────────────────────────────────────────────┐
+│ chat_service.answer_question(query, customer, history)                       │
+│                                                                              │
+│ 1. signed out + account-type question?  -> "please log in" (no model call)   │
+│ 2. retrieve top-3 FAQ chunks from pgvector (previous question included)      │
+│ 3. messages = system(rules + who + FAQ) + last 6 turns + question            │
+│ 4. tool-calling loop (<= 4 rounds, <= 3 calls per round):                    │
+│      llm.complete(messages, tools_for(customer))                             │
+│        tool call?  -> run_tool(name, args, ctx) -> append result -> repeat   │
+│                      ctx.customer = the AUTHENTICATED customer               │
+│        no call?    -> answer                                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+  { answer, sources, needs_authentication, tools_used, order_form }
+     │
+     │  Confirm button:  POST /orders/drafts/{id}/confirm {items, expected_total}
+     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ order_drafts.confirm_form -> orders.create_order  (row locks, stock, prices) │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ```
-   REST resources (class-based views)          Data
-   ProductView  ─┐
-   OrderView    ─┼─ Depends(get_session) ──▶  SQLAlchemy Session ──▶ Postgres
-   TicketView   ─┘   Depends(auth/admin)      (pooled engine)        products, orders,
-                     services/orders.py                              order_items, tickets,
-                     (stock, price, status)                          customers
+  REST resources (class-based views)           Data (PostgreSQL)
+  ------------------------------------         -----------------------------------------
+  ProductTypeView                              product_types  (attribute_schema JSONB)
+  ProductView      Depends(get_session)        products       (attributes, variants JSONB)
+  OrderView        Depends(auth / admin)  -->  orders, order_items (variant_sku)
+  TicketView                                   order_drafts, cancellation_requests
+                   services/: catalog,         tickets, customers
+                   variants, orders,           documents      (pgvector FAQ embeddings)
+                   order_drafts,
+                   order_cancellations
 ```
 
 **Design principles**
 
-- **Retrieval is separate from generation.** FAQ text is fetched once, up front; the model still only sees what was explicitly given to it or what it explicitly requested.
-- **The model decides what it needs; the server decides what it's allowed to have.** Tool calling lets the model choose *which* tool and *what search/lookup arguments* (a product query, an order number). It never chooses *whose* data — every account tool reads the customer from the verified login token via `ToolContext`, not from the model's arguments. See §5.6 and the module docstring of `app/services/tools.py`.
-- **The model never touches the database and never writes SQL.** Only the fixed, read-only tools in `tools.py` exist for it to call. (Letting an LLM generate SQL would hand anyone who can chat a path to the whole database.)
-- **Authorization is enforced by what a tool is allowed to fetch, not by what the model is told.** A signed-out caller isn't even offered the account tools; another customer's order returns the same "not found" as a nonexistent one. The system prompt also tells the model to decline such questions, but that's not the safeguard — the data being unreachable is.
-- **The server owns the money.** Clients send product ids and quantities only; prices, totals, status and ownership are set server-side.
+- **Retrieval is separate from generation.** FAQ text is fetched up front; the model sees only what it was given or explicitly requested.
+- **The model decides what it needs; the server decides what it's allowed to have.** The model chooses *which* tool and *what* lookup arguments. It never chooses *whose* data: account tools read the customer from the verified token via `ToolContext`, never from the model's arguments.
+- **The model never touches the database and never writes SQL.** Only the fixed tools in `tools.py` exist for it to call.
+- **Authorization is enforced by what a tool can reach, not by what the model is told.** Signed-out callers aren't offered account tools; another customer's order looks identical to a nonexistent one.
+- **Write actions need a confirmation the server verifies.** Ordering and cancelling are two-step; the checks (earlier turn, clear yes, expiry, unchanged total) are in code and covered by tests.
+- **The server owns the money.** Clients send product/variant ids and quantities only; prices, totals, status and ownership are set server-side. The order form must echo the total it showed, or nothing is ordered.
 
 ---
 
@@ -109,40 +126,37 @@ The model never touches the database and never writes SQL. Every tool call runs 
 ```
 support-bot/
 ├── app/
-│   ├── main.py                    # FastAPI app; lifespan: migrate → index FAQ → build clients
-│   ├── config.py                  # env-driven settings (fail-fast), incl. LLM_MODEL/LLM_PROVIDER
-│   ├── db/
-│   │   ├── base.py                # SQLAlchemy DeclarativeBase
-│   │   ├── session.py             # pooled engine + session factory
-│   │   └── migrate.py             # runs `alembic upgrade head` in-process
-│   ├── models/                    # ORM models
-│   │   ├── customer.py  product.py  order.py (Order, OrderItem)  ticket.py
-│   │   └── enums.py               # status / billing-period values shared with schemas
+│   ├── main.py                    # FastAPI app; lifespan: migrate -> index FAQ -> build clients
+│   ├── config.py                  # env-driven settings (fail-fast); HF token list; LLM model/provider
+│   ├── db/  base.py  session.py (pooled engine, sqlalchemy_url)  migrate.py
+│   ├── models/                    # customer, product (Product, ProductType), order (Order, OrderItem,
+│   │                              #   OrderDraft, CancellationRequest), ticket, enums
 │   ├── api/
-│   │   ├── deps.py                # token → customer; require_admin; get_session
-│   │   ├── routes/                # function-based: auth.py, chat.py, health.py
-│   │   └── views/                 # CLASS-BASED views
-│   │       ├── base.py            # APIView + @route
-│   │       └── products.py  orders.py  tickets.py
-│   ├── schemas/                   # pydantic: auth, chat, product, order, ticket
-│   └── services/
-│       ├── auth.py                # argon2 + JWT
-│       ├── orders.py              # order rules (price snapshot, stock, transitions)
-│       ├── errors.py              # DomainError → HTTP status
-│       ├── database.py            # ORM-backed helpers for tools/login (return dicts)
-│       ├── llm.py                 # HF chat client wrapper: model/provider, retry, 503 on failure
-│       ├── tools.py               # TOOL CALLING: schemas + handlers the model may invoke
-│       ├── customer_lookup.py     # signed-out gate only (spots account-type questions)
-│       ├── chat_service.py        # retrieve FAQ → tool-calling loop → answer
-│       ├── vector_knowledge_base.py  embeddings.py  document_loader.py
-├── migrations/                    # Alembic: env.py, versions/0001, 0002
-├── alembic.ini
-├── knowledge/faq.md               # FAQ source (8 sections)
-├── seed_data.py                   # migrate + demo admin/customers/products/orders/tickets
-├── tests/test_tool_calling.py     # pytest: the loop + tools, against a scripted fake LLM
-├── Dockerfile  docker-compose.yml  requirements.txt  requirements-dev.txt
-├── .env.example  .gitignore  .dockerignore
-├── README.md  DOCUMENTATION.md  TECH_STACK.md
+│   │   ├── deps.py                # token -> customer; customer_from_token; require_admin; get_session
+│   │   ├── routes/                # function-based: auth, chat (REST), chat_ws (WebSocket), health, web (/)
+│   │   └── views/                 # class-based: base, product_types, products, orders, tickets
+│   ├── schemas/                   # pydantic: auth, chat (incl. OrderForm, WS frames), product
+│   │                              #   (incl. variants), product_type, order (incl. order form), ticket
+│   ├── services/
+│   │   ├── auth.py                # argon2 + JWT
+│   │   ├── catalog.py             # attribute + variant validation against the product type
+│   │   ├── variants.py            # variant lookup, price, stock, labels, SKU uniqueness, in-stock SQL
+│   │   ├── orders.py              # create_order (variant-aware, locks), status transitions
+│   │   ├── order_drafts.py        # bot quotes, "clear yes" check, order form confirm/discard
+│   │   ├── order_cancellations.py # two-step cancellation
+│   │   ├── database.py            # dict-returning helpers for tools and login
+│   │   ├── llm.py                 # HF client: retry, multi-token failover, 503 on failure
+│   │   ├── tools.py               # the 9 tools + their security model
+│   │   ├── chat_service.py        # FAQ -> tool-calling loop -> answer (+ order form)
+│   │   ├── customer_lookup.py     # signed-out gate (spots account-type questions)
+│   │   └── vector_knowledge_base.py  embeddings.py  document_loader.py  errors.py
+│   └── web/index.html             # browser chat page + order form
+├── migrations/versions/           # 0001 ... 0006
+├── knowledge/faq.md               # 20 FAQ sections
+├── seed_data.py                   # demo accounts, 6 product types, catalog with variants, orders, tickets
+├── tests/                         # conftest (rolled-back Postgres session) + 6 test files
+├── Dockerfile  docker-compose.yml  requirements.txt  requirements-dev.txt  .env.example
+└── README.md  DOCUMENTATION.md  TECH_STACK.md
 ```
 
 ---
@@ -150,208 +164,210 @@ support-bot/
 ## 5. Components in Detail
 
 ### 5.1 `app/main.py`
-The `lifespan` hook, once at startup: (1) `run_migrations()`; (2) creates the pooled engine + session factory; (3) indexes `knowledge/` into pgvector; (4) builds `LLMClient`. Everything is stored on `app.state` (`session_factory`, `db`, `kb`, `llm`) and the engine is disposed on shutdown. Registers the function-based routers, the three class-based view routers, and an exception handler mapping `DomainError` → JSON `{"detail": …}` with the right status (and `Retry-After` for 503).
+At startup: runs migrations, creates the pooled engine and session factory, indexes `knowledge/` into pgvector, and builds the `LLMClient` with every configured token. Registers the function-based routers (auth, chat, chat_ws, web, health), the class-based views (product types, products, orders, tickets), and maps `DomainError` subclasses to JSON errors with the right status (`Retry-After` on 503).
 
 ### 5.2 `app/config.py`
-`Settings` from a cached `get_settings()`; **fails fast** if `HF_TOKEN`, `DATABASE_URL` or `JWT_SECRET` is missing, or if `JWT_SECRET` is shorter than 32 characters. Also holds `llm_model`/`llm_provider`, read from `LLM_MODEL`/`LLM_PROVIDER` env vars, defaulting to `Qwen/Qwen2.5-72B-Instruct` on `deepinfra`.
+`get_settings()` fails fast if `HF_TOKEN`, `DATABASE_URL` or `JWT_SECRET` is missing or `JWT_SECRET` is under 32 characters. `hf_tokens` is `HF_TOKEN` followed by `HF_FALLBACK_TOKENS` (comma-separated, blanks and duplicates removed). Also `llm_model` / `llm_provider` (default `Qwen/Qwen2.5-72B-Instruct` on `deepinfra`).
 
 ### 5.3 Models (`app/models/`)
-SQLAlchemy 2.0 typed models, with CHECK constraints mirrored from the migrations so the database enforces the rules even if application code is bypassed:
 
 | Model | Notes |
 |---|---|
 | `Customer` | `email` unique, `plan`, `password_hash` (nullable), `is_admin`, `created_at` |
-| `Product` | `sku` unique; `price ≥ 0`; `stock_quantity` NULL = unlimited, else `≥ 0`; `billing_period ∈ {one_time, monthly, yearly}`; `is_active` |
-| `Order` | `customer_id` FK; `status ∈ {pending, processing, completed, cancelled}`; `total_amount`; `items` (selectin-loaded) |
-| `OrderItem` | `order_id` FK (cascade delete), `product_id` FK, **`product_name` and `unit_price` copied at purchase time**, `quantity > 0` |
+| `ProductType` | `slug` unique, `name`, `description`, **`attribute_schema` JSONB** (attribute definitions, incl. `"variant": true` flags), `is_active` |
+| `Product` | `sku` unique, `product_type_id` FK (joined, inner-join load), **`attributes` JSONB**, `price ≥ 0`, `billing_period`, `stock_quantity` (NULL = unlimited; NULL when variants exist), **`variants` JSONB** (GIN index), `is_active` |
+| `Order` | `customer_id` FK; `status ∈ {pending, processing, completed, cancelled}`; `total_amount`; `items` |
+| `OrderItem` | `order_id` FK (cascade), `product_id` FK, **`variant_sku`**, `product_name` and `unit_price` **snapshotted** at purchase, `quantity > 0` |
+| `OrderDraft` | A bot quote: `lines` JSONB, `total_amount`, `status ∈ {open, placed, superseded, expired}`, `order_id`, `created_at`/`expires_at` (app clock) |
+| `CancellationRequest` | `order_id`, `status ∈ {open, done, superseded, expired}`, `created_at`/`expires_at` |
 | `Ticket` | `customer_id` FK; `subject`, `description`; `status ∈ {open, in_progress, resolved, closed}` |
 
-Snapshotting name and price on `OrderItem` means a later price change or rename never rewrites order history.
+Snapshotting name (including the variant, e.g. "Acme logo T-shirt (Size: M, Colour: Black)") and price means later changes never rewrite order history.
 
 ### 5.4 Migrations (`migrations/`)
-Alembic with `env.py` reading `DATABASE_URL` (never stored in `alembic.ini`); the pgvector `documents` table is excluded from autogenerate (`include_name`).
 
-- **`0001_baseline`** — the pre-Alembic tables (`customers`, `orders`, `tickets`), every statement `IF NOT EXISTS`, so it is a no-op on an existing database and creates them on a new one.
-- **`0002_products_orders_tickets`** — adds `customers.is_admin/created_at`, `products`, `order_items`; adds `orders.total_amount/updated_at`; adds `tickets.description/updated_at`; adds CHECK constraints and indexes. **Converts legacy data**: each old order (`item`, `amount`) becomes one `order_items` row pointing at an *inactive* "legacy" product, then `orders.item/amount` are dropped. Irreversible (downgrade raises).
+| Migration | Change |
+|---|---|
+| `0001_baseline` | Pre-Alembic tables (`customers`, `orders`, `tickets`), all `IF NOT EXISTS` |
+| `0002_products_orders_tickets` | Products, order line items, admin flag, CHECK constraints; converts legacy orders into line items (irreversible) |
+| `0003_product_types` | `product_types`; `products.product_type_id` and `attributes`; existing products moved to a `general` type |
+| `0004_order_drafts` | Bot quotes |
+| `0005_cancellation_requests` | Bot cancellation requests |
+| `0006_product_variants` | `products.variants` JSONB + GIN index; `order_items.variant_sku` |
 
-The app applies pending migrations at startup (convenient for development; with several instances, run `alembic upgrade head` as a single deploy step instead so they don't race).
+Applied at startup (convenient for one instance; run `alembic upgrade head` as a deploy step with several). The pgvector `documents` table is excluded from autogenerate.
 
 ### 5.5 Class-based views (`app/api/views/`)
-FastAPI has no built-in class-based views, so `base.py` provides a small dependency-free `APIView` + `@route(method, path, **kwargs)`:
-
-```python
-class TicketView(APIView):
-    prefix = "/tickets"
-    tags = ["tickets"]
-
-    @route("POST", "", response_model=TicketOut, status_code=201)
-    def create_ticket(self, payload: TicketCreate,
-                      session: Session = Depends(get_session),
-                      customer: dict = Depends(get_current_customer)): ...
-
-app.include_router(TicketView.as_router())
-```
-Methods are ordinary FastAPI handlers (`self` isn't part of the request signature); dependencies arrive as parameters, so a single instance holds no per-request state. Routes register in definition order and a subclass can override an endpoint by redefining the method.
+FastAPI has no class-based views, so `base.py` provides a small `APIView` + `@route`. Inbound schemas use `extra="forbid"` (unknown fields → 422).
 
 | View | Behaviour |
 |---|---|
-| `ProductView` | Public reads of **active** products (search, pagination); inactive products look nonexistent to non-admins; admin create/PATCH/DELETE; duplicate SKU → 409; deleting a product that appears on an order → 409 (deactivate instead) |
-| `OrderView` | Customers create and see only their own orders; admins see all; cancel; admin status changes |
-| `TicketView` | Customers open/see/close their own tickets; admins see all and set status |
-
-Inbound schemas use `extra="forbid"`, so unknown fields (`price`, `status`, `customer_id`, `is_admin`, …) are a 422 instead of being silently ignored — a defence against mass-assignment. The same principle is reused for tool arguments (§5.6).
+| `ProductTypeView` | Public reads of active types; admin create/PATCH/DELETE. Changing `attribute_schema` is refused (409) if existing products would no longer be valid; a type with products can't be deleted (409). |
+| `ProductView` | Public reads of active products, filters `q`, `type`, `min_price`, `max_price`, `in_stock` (variant-aware); admin writes validate attributes and variants against the type, enforce SKU uniqueness across products **and** variants (advisory locks), and require product stock to be NULL when variants exist. Validation share-locks the type row. |
+| `OrderView` | Customers create/see their own orders (lines take `variant_sku`); admins see all; cancel; admin status changes; **order form** `POST /orders/drafts/{id}/confirm` and `/discard`. |
+| `TicketView` | Customers open/see/close their own tickets; admins see all and set status. |
 
 ### 5.6 Tool calling (`app/services/tools.py`)
-This is the core of the current design. `run_tool(tools, name, raw_arguments, ctx)` executes one model-requested tool call and never raises — every failure mode becomes a JSON error result the model reads and can react to.
+`run_tool` executes one model-requested call and never raises — every failure becomes a JSON error the model reads.
 
-**Registered tools:**
-
-| Tool | Login required | Wraps |
+| Tool | Login | What it does |
 |---|---|---|
-| `search_products` | No | `Database.search_products` — keyword + max-price + in-stock filter over active products |
-| `get_order` | Yes | `Database.get_order_for_customer` — one order by number, scoped to the caller |
-| `list_my_orders` | Yes | `Database.get_orders_for_customer` — optional status filter |
-| `list_my_tickets` | Yes | `Database.get_tickets_for_customer` — optional status filter |
+| `search_products` | No | Keyword (name, description, SKU, attribute values, variant options, type), category, max price, in-stock search, ranked by matching terms; lists variants with their SKU, options, price and availability; names sold-out matches when filtering to in-stock |
+| `list_product_types` | No | Active categories with product counts and the details each lists |
+| `get_order` | Yes | One of the caller's orders by number |
+| `list_my_orders` | Yes | The caller's orders, optional status filter |
+| `list_my_tickets` | Yes | The caller's tickets, optional status filter |
+| `prepare_order` | Yes | Quote items (product or variant SKUs + quantities); saves a draft; returns a summary to the model and an **order form** to the client |
+| `confirm_order` | Yes | Place the caller's open quote — refused unless the latest message is a clear yes (plus the draft checks, §5.12) |
+| `request_cancellation` | Yes | Check one of the caller's orders can be cancelled; record the request |
+| `confirm_cancellation` | Yes | Cancel it — refused unless the latest message is a clear yes |
 
-**The security model, in order of what actually stops abuse:**
-1. **No argument schema contains a customer identifier.** `GetOrderArgs` has only `order_id`; there is no field the model could set to another customer's id even if it tried.
-2. **`ToolContext.customer` comes from the verified JWT**, set once per request in `chat_service.answer_question`, not from anything in the conversation.
-3. **`tools_for(customer)` filters the offered tools** before the model ever sees them — a signed-out caller's tool list contains only `search_products`. `run_tool` re-checks `tool.requires_login` too, so even a tool named by a signed-out model (a possible model error, not a client attack, since the client never controls what tools are offered) is refused.
-4. **Ambiguity is intentional:** `get_order` returns the same `"No order with ID N exists on this account"` whether the order belongs to someone else or doesn't exist, so order ids can't be probed for existence.
+**Security model:** no argument schema contains a customer identifier (a test asserts no tool parameter even mentions "customer"); `ToolContext.customer` comes from the verified JWT; `tools_for(customer)` filters what's offered and `run_tool` re-checks; another customer's order returns the same "not found" as a nonexistent one; tool results are labelled as data, not instructions.
 
-**Robustness details:**
-- **Argument validation** via pydantic (`SearchProductsArgs`, `GetOrderArgs`, etc.) — a non-integer `order_id` becomes an error result, not a crash, and `_parse_arguments` copes with a provider returning `""`, `null`, a dict, or a malformed string for `arguments`.
-- **`_clean_schema`** strips pydantic's `title`s and collapses `anyOf: [X, null]` (an optional field) down to plain `X` — smaller, simpler schemas are followed more reliably by a 72B-class model than pydantic's raw, verbose output.
-- **Search term cleaning (`search_terms`)** lower-cases, drops filler words ("the", "under", "dollars", …) and short/plural noise, and caps at 5 terms, so a natural-language query like *"do you have any plan under 10 dollars a month"* becomes the single keyword `plan` rather than matching everything or nothing.
-- **Result size cap** (`MAX_RESULT_CHARS`) — an oversized result becomes an error asking for narrower results, rather than blowing up the context.
-- **Tool results are explicitly labelled as data, not instructions**, in the system prompt — a ticket description is customer-written text that could contain a prompt injection attempt.
+**Robustness:** pydantic argument validation; `_inline_refs` + `_clean_schema` produce small, self-contained schemas (no `$ref`, `title`, `anyOf`); search-term cleaning; result size cap; the order form is popped out of the tool result so it reaches the client, not the model's context.
 
-### 5.7 The tool-calling loop (`chat_service.answer_question`)
-1. **Login gate** — unchanged from before tool calling: if signed out and the question needs account access (`customer_lookup.needs_account_access`), return the login prompt immediately. No retrieval, no model call.
-2. **FAQ retrieval** — top-`k` chunks from pgvector, folded into the first user message. Kept outside the tool loop because it's free (local embeddings) and policy/how-to text doesn't belong behind a tool.
-3. **The loop** (`MAX_TOOL_STEPS = 4` rounds, `MAX_CALLS_PER_STEP = 3` calls honoured per round):
-   - Call `llm.complete(messages, tools=schemas)`.
-   - No `tool_calls` in the reply → that's the answer; return it.
-   - Otherwise, append the assistant's tool-call message, run each call (skipping any beyond the per-step cap, and short-circuiting an **exact repeat** of an already-made call so a model that loops on the same call doesn't re-run it or spin forever), append each result as a `role: "tool"` message, and loop.
-   - If the cap is reached without a plain answer, one final call is made with the tools removed, forcing the model to answer from what it already has (`FINAL_ANSWER_NUDGE`).
-4. Returns a `ChatResult` with `answer`, `sources` (FAQ files only), `needs_authentication`, and `tools_used` (names of tools actually executed, for transparency in the API response).
+### 5.7 The chat loop (`chat_service.answer_question`)
+1. **Login gate** — signed out + account-type question (regex) → login prompt, no model call.
+2. **FAQ retrieval** — top 3 chunks; for follow-ups the previous question is searched too.
+3. **Messages** — system message (rules, who is signed in, FAQ text), then up to 6 earlier turns, then the question alone. (Keeping the FAQ out of the latest user message was needed for follow-ups to resolve against the conversation.)
+4. **Loop** — ≤ 4 rounds, ≤ 3 calls per round, exact repeats short-circuited; at the cap, one final tools-off call.
+5. **Result** — `answer`, `sources`, `needs_authentication`, `tools_used`, `order_form`. If a form is attached and the model's reply is near-empty, a standard sentence pointing at the form is used.
+
+The system prompt includes a worked example so the model shows the order form straight away instead of first asking "which size?".
 
 ### 5.8 `app/services/llm.py`
-Thin wrapper isolating the provider and its failure modes: retries **once** on a transient 5xx or network error, does **not** retry a 429 (retrying a rate limit only worsens it), and turns any provider failure into a clean **503 + `Retry-After`** instead of an unhandled 500. `temperature=0.2` — low, since tool-argument choices and refusals benefit from consistency more than creative variation.
+Several tokens, tried in order. A 401/402/403/429 on a token moves the same request to the next token and benches the failed one (1 hour; 1 minute for 429). If all are benched, all are tried anyway (soonest-available first). Transient 5xx/network errors are retried once on the same token; other failures become 503. Every provider error is logged with the token's last 4 characters only. `temperature=0.2`.
 
-### 5.9 Authentication (`app/services/auth.py`, `app/api/deps.py`, `routes/auth.py`)
-- **argon2id** password hashing; `verify_password` does equivalent work for unknown users so timing doesn't reveal which emails exist.
-- **JWT (HS256)** with `sub`/`iat`/`exp`; decoding pins the algorithm and requires `exp` and `sub` (rejecting `alg: none` and non-expiring tokens).
-- `get_optional_customer` — no token → anonymous; an *invalid/expired* token → 401 (never silently downgraded). `get_current_customer` requires a login. **`require_admin`** → 403 for non-admins. `get_session` yields one pooled ORM session per request.
-- `POST /auth/register` never sets `is_admin` (the schema forbids it) and uses `ON CONFLICT DO NOTHING`, so it can't claim an existing account.
+### 5.9 Authentication
+Argon2id hashing (timing-equal for unknown users); JWT HS256 with required `exp`/`sub`; invalid tokens → 401 (never silently anonymous); `require_admin` → 403; registration can't set `is_admin` or claim an existing email. The WebSocket uses the same token check (`customer_from_token`).
 
 ### 5.10 `app/services/orders.py`
-- **`create_order`** — merges duplicate lines; caps quantity per product at 100; **locks the product rows** (`SELECT … FOR UPDATE`, in id order to avoid deadlocks); rejects unknown *and* inactive products with the same message; checks and decrements stock; snapshots name/price; computes the total from database prices. Never commits — the view commits once, so any failure (e.g. the last line out of stock) rolls back everything, including stock already decremented.
-- **Status transitions** — admin: `pending → processing | cancelled`, `processing → completed | cancelled`; `completed` and `cancelled` are final. A customer may only cancel their own **pending** order.
-- **`get_order_for_actor`** — returns the order only to its owner or an admin, otherwise `404` identical to a nonexistent id.
+`create_order(session, customer_id, [(product_id, variant_sku, quantity)])` merges duplicate lines, caps 100 per line, locks product rows (`FOR UPDATE OF products`, id order), requires a variant for products that have them, refuses unknown/inactive products or variants (including a variant SKU the product doesn't have) with one message, checks and changes stock on the product or variant, snapshots name and price, and never commits. Cancelling returns stock to the right variant. Status transitions: admin `pending → processing | cancelled`, `processing → completed | cancelled`; customers may cancel their own pending orders.
 
-### 5.11 `app/services/database.py`
-ORM-backed helpers returning plain dicts, used by both the tools and the auth routes: `get_customer_by_id` (never selects `password_hash`), `get_customer_auth_record`, `create_customer` (`ON CONFLICT DO NOTHING`), `get_order_for_customer`, `get_orders_for_customer`, `get_tickets_for_customer` (all keyed by `customer_id`, filterable by status, capped rows), `search_products` (keyword/price/stock filter over active products). Uses a **pooled** engine.
+### 5.11 Catalog and variants (`catalog.py`, `variants.py`)
+- **`catalog.validate_product`** checks a product against its type: without variants, all attributes on the product; with variants, variant-flagged attributes in each variant's `options` and the rest on the product; required/unknown/kind/choice checks; unique variant SKUs and option combinations; max 50 variants. Returns the stored JSON form (SKUs upper-case, prices as strings).
+- **`variants.py`** — `resolve_sku` (product or variant SKU → product + variant, via a GIN-indexed containment query), `unit_price`, `stock_of`, `change_stock` (replaces the JSON list so the change is saved), `display_name`, `sellable_items`, `in_stock_clause` (SQL using `jsonb_path_exists`), `lock_skus` (advisory locks) and `sku_taken`.
 
-### 5.12 Retrieval stack
-`document_loader.py` (chunk `.md` by `##`, `.txt` by paragraph), `embeddings.py` (local `bge-small-en-v1.5`), `vector_knowledge_base.py` (self-provisions the `vector` extension, `documents` table and HNSW cosine index; wipes and re-indexes `knowledge/` at startup; `retrieve()` returns top-k by cosine similarity). It still uses its own psycopg2 connections, separate from the pooled ORM engine.
+### 5.12 Ordering by chat (`order_drafts.py`)
+- **`prepare_draft`** resolves SKUs (a base product's SKU preselects an in-stock variant), checks stock, supersedes the customer's previous open draft, saves the quote, and builds the **order form** (each line's variants with name, price, billing period and max quantity).
+- **`confirm_draft`** (typed "yes"): latest open draft, locked; refused if expired, created in the same request, or if the total changed (a savepoint undoes the stock taken).
+- **`confirm_form`** (button click): the customer's chosen SKUs and quantities; must be their own open, unexpired draft; refused (409, nothing saved) if the total differs from `expected_total`. A click is the confirmation, so no earlier-turn rule.
+- **`is_confirmation(message, action)`** — strict English pattern; "no", "wait", "change", "keep"... mean no; "cancel" means no when confirming an order but yes when confirming a cancellation.
 
-### 5.13 `app/services/customer_lookup.py` (trimmed)
-Now holds *only* the signed-out gate: `extract_email`, `extract_order_id`, `looks_personal`, `needs_account_access`. Its former job of building the signed-in customer's context (`build_customer_context`) is gone — that's now what the tools in `tools.py` do, scoped by the authenticated customer rather than by parsing the question.
+### 5.13 Cancelling by chat (`order_cancellations.py`)
+`request_cancellation` (own order, still pending; explains processing/completed/cancelled cases) and `confirm_cancellation` (latest open request, locked; earlier turn, not expired; `transition_order` — refused if the order moved on meanwhile). Orders are always looked up by the authenticated customer's id, so even admins can only cancel their own orders through the bot.
+
+### 5.14 WebSocket chat (`routes/chat_ws.py`)
+Per-connection `Conversation`: token, customer, history (≤ 6 turns). Frames are validated with a discriminated pydantic union; oversized, binary or invalid frames get an `invalid_frame` error and the socket stays open. The token is re-checked before each question; an expired token produces `unauthorized` and a sign-out, never an anonymous answer. Changing identity clears the history. Blocking work runs in the thread pool.
+
+### 5.15 Web chat page (`app/web/index.html`)
+Sign in / register, chat over WebSocket (auto-reconnect with backoff) or REST (sends recent history), source and tool chips, and the **order form** card: variant picker with prices (sold-out options disabled), quantity capped at stock, live line and order totals (computed in cents), Confirm / Cancel. A newer form retires older ones. Token kept in `sessionStorage`; light/dark aware; phone-width layout.
+
+### 5.16 Retrieval stack
+`document_loader.py` chunks `.md` by `##`; `embeddings.py` runs `bge-small-en-v1.5` locally; `vector_knowledge_base.py` self-provisions the `vector` extension, `documents` table and HNSW cosine index, re-indexes `knowledge/` at startup, and returns top-k by cosine similarity (own psycopg2 connections).
 
 ---
 
 ## 6. Data Model
 
-**Managed by Alembic** (`app/models/`)
-
 | Table | Columns |
 |---|---|
-| `customers` | `id`, `name`, `email` (unique), `plan`, `password_hash` (nullable), `is_admin`, `created_at` |
-| `products` | `id`, `sku` (unique), `name`, `description`, `price NUMERIC(10,2)`, `billing_period`, `stock_quantity` (nullable), `is_active`, `created_at`, `updated_at` |
-| `orders` | `id`, `customer_id → customers`, `status`, `total_amount`, `created_at`, `updated_at` |
-| `order_items` | `id`, `order_id → orders (cascade)`, `product_id → products`, `product_name`, `unit_price`, `quantity` |
-| `tickets` | `id`, `customer_id → customers`, `subject`, `description`, `status`, `created_at`, `updated_at` |
+| `customers` | `id`, `name`, `email` (unique), `plan`, `password_hash`, `is_admin`, `created_at` |
+| `product_types` | `id`, `slug` (unique), `name`, `description`, `attribute_schema` JSONB, `is_active`, timestamps |
+| `products` | `id`, `sku` (unique), `product_type_id → product_types`, `name`, `description`, `attributes` JSONB, `price`, `billing_period`, `stock_quantity`, `variants` JSONB (GIN), `is_active`, timestamps |
+| `orders` | `id`, `customer_id → customers`, `status`, `total_amount`, timestamps |
+| `order_items` | `id`, `order_id → orders (cascade)`, `product_id → products`, `variant_sku`, `product_name`, `unit_price`, `quantity` |
+| `order_drafts` | `id`, `customer_id`, `lines` JSONB, `total_amount`, `status`, `order_id`, `created_at`, `expires_at` |
+| `cancellation_requests` | `id`, `customer_id`, `order_id`, `status`, `created_at`, `expires_at` |
+| `tickets` | `id`, `customer_id → customers`, `subject`, `description`, `status`, timestamps |
+| `documents` (app-managed) | `id`, `source`, `content`, `embedding VECTOR(384)` — rebuilt from `knowledge/` at startup |
 
-**Managed by the app itself:** `documents` (`id`, `source`, `content`, `embedding VECTOR(384)`, HNSW index) — rebuilt from `knowledge/` on every start.
+**A variant** (an element of `products.variants`):
+```json
+{"sku": "TSHIRT-LOGO-BLK-M", "options": {"size": "M", "color": "Black"},
+ "price": null, "stock_quantity": 30, "is_active": true}
+```
 
-**Breaking change from earlier versions:** `orders.item` / `orders.amount` no longer exist. Existing orders were migrated into `order_items` (see §5.4). `schema.sql` was removed — Alembic is the source of truth.
+**Demo data** (`seed_data.py`, idempotent):
 
-**Demo data** (`seed_data.py`, idempotent — only adds what's missing):
-
-| Accounts | Products |
+| | |
 |---|---|
-| `admin@example.com` (admin), `ada@example.com` (pro), `grace@example.com` (plus) — **random passwords, printed once** | Free / Plus / Pro plan (monthly), Pro plan – annual, Extra 500GB add-on, **Acme Backup Drive 1TB** ($89, 10 in stock — exercises the stock logic) |
-
-Orders (Ada: Pro plan – annual, completed; Grace: 500GB add-on, processing) and tickets are inserted only into an empty database. The seed **never promotes a pre-existing account to admin** (someone could have registered `admin@example.com` first); it prints a warning instead.
+| Accounts | `admin@example.com` (admin), `ada@example.com`, `grace@example.com` — random passwords, printed once; never promotes a pre-existing account |
+| Product types | Digital services, Electronics, Clothing, Books, Home & kitchen, Gift cards (+ the migration's `general`) |
+| Products | 25 active; 5 with variants (14 variants): Acme logo T-shirt (black/white × M/L), Zip hoodie (3), Acme Backup Drive (1TB/4TB), Digi Store gift card ($25/$50/$100), The Backup Handbook (paperback/e-book). One deliberately sold-out product (USB-C hub) and one inactive (kettle). |
+| Conversion | On an existing database, earlier per-size products became variants (stock carried over); the old rows stay inactive as `…-OLD<id>` for order history. Types created before variants are upgraded if their products stay valid. |
 
 ---
 
 ## 7. API Reference
 
 ### 7.1 Authentication
-- `POST /auth/register` — JSON `{name, email, password}` (name 1–100; email `x@y.z`, trimmed + lower-cased; password 8–128). `201` profile, `409` if the email exists, `422` on bad input or unknown fields.
-- `POST /auth/login` — form fields `username` (email) and `password` → `{access_token, token_type, expires_in}`. One identical `401` for every failure.
-- `GET /auth/me` — the caller's profile `{id, name, email, plan, is_admin}`.
+- `POST /auth/register` — `{name, email, password}` → `201` profile; `409` if the email exists.
+- `POST /auth/login` — form `username` (email) + `password` → `{access_token, token_type, expires_in}`; one identical `401` for every failure.
+- `GET /auth/me` — the caller's profile.
 
-Send `Authorization: Bearer <token>`; tokens last `JWT_EXPIRE_MINUTES` (default 60), no refresh endpoint.
-
-### 7.2 Products, orders, tickets
+### 7.2 Store resources
 
 | Endpoint | Signed out | Customer | Admin |
 |---|---|---|---|
-| `GET /products`, `GET /products/{id}` | active only | active only | + inactive (`?include_inactive=true`) |
-| `POST /products` · `PATCH /products/{id}` · `DELETE /products/{id}` | 401 | 403 | yes |
-| `POST /orders` | 401 | for yourself | yes (as themselves) |
-| `GET /orders` · `GET /orders/{id}` | 401 | own only | all (`?customer_id=`, `?status=`) |
-| `POST /orders/{id}/cancel` | 401 | own, while `pending` | any cancellable |
+| `GET /product-types`, `GET /product-types/{id}` | active | active | + inactive |
+| `POST/PATCH/DELETE /product-types…` | 401 | 403 | yes |
+| `GET /products`, `GET /products/{id}` | active | active | + inactive |
+| `POST/PATCH/DELETE /products…` | 401 | 403 | yes |
+| `POST /orders` | 401 | for yourself | yes |
+| `GET /orders`, `GET /orders/{id}` | 401 | own | all |
+| `POST /orders/{id}/cancel` | 401 | own, while pending | any cancellable |
 | `PATCH /orders/{id}/status` | 401 | 403 | yes |
-| `POST /tickets` · `GET /tickets` · `GET /tickets/{id}` | 401 | own only | all |
-| `POST /tickets/{id}/close` | 401 | own | yes |
-| `PATCH /tickets/{id}/status` | 401 | 403 | yes |
+| `POST /orders/drafts/{id}/confirm`, `/discard` | 401 | own draft | own draft |
+| `/tickets…` | 401 | own | all |
 
-List endpoints take `limit` (1–100, default 20) and `offset`. Other people's orders/tickets → `404`. Money is a JSON string (`"89.00"`) to avoid float error. Product responses include a computed `in_stock`; **exact stock levels are public** (see limitation 12).
-
-Place an order:
+Placing an order with a variant:
 ```json
 POST /orders
-{ "items": [ {"product_id": 6, "quantity": 2}, {"product_id": 2, "quantity": 1} ] }
+{ "items": [ {"product_id": 12, "variant_sku": "TSHIRT-LOGO-BLK-M", "quantity": 2} ] }
 ```
-Errors: `422` (bad quantity, unknown/inactive product, unknown field), `409` (not enough stock; invalid status transition; duplicate SKU; product is on orders).
-
-### 7.3 `POST /chat` (tool calling)
-`Authorization` optional. Request `{ "question": "…" }` (1–2000 chars). Response:
+Confirming a chat order form:
 ```json
-{ "answer": "...", "sources": ["faq.md"], "needs_authentication": false, "tools_used": ["get_order"] }
+POST /orders/drafts/82/confirm
+{ "items": [ {"sku": "TSHIRT-LOGO-BLK-L", "quantity": 2} ], "expected_total": "48.00" }
+```
+Errors: `422` (validation, unknown/inactive product or variant, missing variant), `409` (stock, status transition, duplicate SKU, price changed, used/expired form).
+
+### 7.3 Chat
+**`POST /chat`** — `{question, history?}` (history: up to 20 `{question, answer}`, last 6 used). Response:
+```json
+{ "answer": "...", "sources": ["faq.md"], "needs_authentication": false,
+  "tools_used": ["search_products", "prepare_order"], "order_form": { ... } | null }
 ```
 
-**Breaking change:** the pre-tool-calling API's `session_id` (request) and `needs_clarification` (response) fields are gone. There is no cross-request session memory any more — each `/chat` call is independent regardless of login state (this was already true; tool calling didn't change it, see limitation "no conversation memory"). `needs_authentication` replaces `needs_clarification`'s role: the bot never needs to ask "what's your email?" since identity now always comes from the token, not from something typed into the question.
+**`WS /ws/chat`** — client frames: `auth {token}`, `message {question}`, `reset`, `ping`. Server frames: `ready`, `auth_ok`, `typing`, `answer` (same fields as `POST /chat`), `reset_ok`, `pong`, `error {code, detail}` with codes `unauthorized`, `invalid_frame`, `service_unavailable`, `internal_error`.
 
-| Caller | Question | Result |
+| Caller | Message | Result |
 |---|---|---|
-| Signed out | general / FAQ | Answered from FAQ |
-| Signed out | product / pricing | May call `search_products` (the only tool it's offered) |
-| Signed out | mentions "my order", an order number, or an email | `needs_authentication: true`, no model call |
-| Signed in | anything | FAQ + whichever tools the model chooses, scoped to **that customer's own** data |
-| Any | provider busy/failing | `503` + `Retry-After` |
-| Bad/expired token | anything | `401` |
+| Signed out | general / FAQ | Answered from the FAQ |
+| Signed out | product question | `search_products` / `list_product_types` only |
+| Signed out | mentions "my order", an order number or an email | `needs_authentication: true`, no model call |
+| Signed in | anything | FAQ + any tool, scoped to that customer |
+| Signed in | "I'd like to order a hoodie" | Quote + order form; placed only after a clear yes or the Confirm button |
+| Any | provider failing | `503` + `Retry-After` (cause in the server log) |
 
 ### 7.4 Other
-`GET /health` → `{"status":"ok"}`. Swagger UI at `/docs` (use **Authorize** once to act as a customer or admin), OpenAPI at `/openapi.json`.
+`GET /` chat page · `GET /health` · `/docs` Swagger UI · `/openapi.json`.
 
 ---
 
 ## 8. Configuration
 
-| Variable | Where set | Purpose |
-|---|---|---|
-| `HF_TOKEN` | `.env` | Hugging Face token with the **"Make calls to Inference Providers"** permission. **Billed** — see §9's cost note |
-| `LLM_MODEL` / `LLM_PROVIDER` | `.env` (optional) | Default `Qwen/Qwen2.5-72B-Instruct` / `deepinfra`. Must be a pair where the provider supports tool calling — verified empirically (§11) since `phi-4`, the original model, does not |
-| `JWT_SECRET` | `.env` | Signs login tokens. **Required, ≥32 chars.** Changing it logs everyone out |
-| `JWT_EXPIRE_MINUTES` | `.env` (optional) | Token lifetime, default 60 |
-| `DATABASE_URL` | `docker-compose.yml` (Docker) or `.env` | Postgres URL; in Docker it points at the `db` service and overrides `.env`. Also read by Alembic |
+| Variable | Purpose |
+|---|---|
+| `HF_TOKEN` | Hugging Face token with "Make calls to Inference Providers". **Billed.** |
+| `HF_FALLBACK_TOKENS` | Optional, comma-separated extra tokens (ideally other accounts) used on 401/402/403/429 |
+| `LLM_MODEL` / `LLM_PROVIDER` | Default `Qwen/Qwen2.5-72B-Instruct` / `deepinfra`; the pair must support tool calling |
+| `JWT_SECRET` | Required, ≥ 32 characters; changing it logs everyone out |
+| `JWT_EXPIRE_MINUTES` | Token lifetime, default 60 |
+| `DATABASE_URL` | Set by Compose for Docker; plain `postgresql://` (the app adds `+psycopg2` for SQLAlchemy) |
 
-`.env` is gitignored and dockerignored. The compose DB credentials are dev-only.
+`.env` is git- and docker-ignored. After editing `.env`, run `docker compose up -d --force-recreate app` (a plain restart doesn't re-read it).
 
 ---
 
@@ -359,64 +375,49 @@ Errors: `422` (bad quantity, unknown/inactive product, unknown field), `409` (no
 
 ```bash
 cp .env.example .env                              # set HF_TOKEN and JWT_SECRET
-docker compose up -d                              # db + app; tables are created by migrations at startup
-docker compose run --rm app python seed_data.py   # demo data; COPY the printed passwords
+docker compose up -d                              # db + app; migrations run at startup
+docker compose run --rm app python seed_data.py   # demo data; copy the printed passwords
 ```
-API at `http://localhost:8020` (8000 was already taken on this machine). Uvicorn runs with `--reload` on a bind-mounted project, so code edits apply immediately; rebuild only when `requirements.txt` changes.
+Chat page and API at `http://localhost:8020`. Code edits reload automatically; **FAQ edits** need `docker compose restart app` to be re-indexed.
 
-**Cost note:** the LLM is billed against the HF account's credits — no provider on the router is free (verified against the live listing, §11). A `402 Payment Required` from `/chat` means the account is out of credit; the tool-calling loop uses more tokens per question than the earlier single-call design (§10).
-
-**Tests** (a scripted fake model — no network, no Postgres, no credits):
+**Tests** (fake LLM; database tests use the running Postgres inside rolled-back transactions and skip without it):
 ```bash
 docker compose run --rm app sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
 ```
 
-**Migrations:** `docker compose run --rm app alembic upgrade head` · `alembic current` · `alembic check` (models vs database) · `alembic revision --autogenerate -m "msg"` (always review the generated file).
-
-**Upgrading an existing database:** just start the app — the migrations convert existing orders into line items. Run the seed to add an admin, the catalog, and passwords for any customer that lacks one.
-
-**Inspect the DB:** `docker compose exec db psql -U supportbot -d supportbot`
+**Cost note:** every chat message spends HF credits (more when tools are used). A free account covers only a handful of conversations; `402` in the log means out of credit. Benched tokens are cleared by `docker compose restart app`.
 
 ---
 
 ## 10. Testing Performed
 
-### 10.1 Automated (pytest, `tests/test_tool_calling.py`, 26 tests, committed to the repo)
+### 10.1 Automated — 203 tests
 
-Run against a scripted `FakeLLM` (a queue of canned replies) and a `FakeDB` — no network, no Postgres, no HF credits, so these run in well under a second and are part of the repo rather than an ad-hoc script.
+| File | Tests | Covers |
+|---|---|---|
+| `test_tool_calling.py` | 58 | Loop, scoping, tool offers, argument validation, retries, **token failover**, ordering/cancelling tool guards, order form hand-off |
+| `test_order_drafts.py` | 50 | Quotes, earlier-turn rule, expiry, price change + savepoint, one-time use, variant forms, form confirm/discard (real Postgres) |
+| `test_catalog.py` | 42 | Attribute and variant validation, type definitions, slugs |
+| `test_order_cancellations.py` | 22 | Two-step cancellation, wording, admins limited to own orders (real Postgres) |
+| `test_chat_ws.py` | 19 | History, WebSocket auth, re-check, reset, bad frames, errors |
+| `test_variants.py` | 12 | Variant ordering, price override, stock, cancel restock, SKU lookup/uniqueness, in-stock SQL (real Postgres) |
 
-- **The loop:** signed-out account questions are gated before any model call; a plain answer with no tool calls passes through; a tool call is executed and its result fed back correctly; **the model-supplied `customer_id` is ignored** and the authenticated id is used instead; someone else's order and a nonexistent order produce an identical message; signed-out callers are offered only `search_products`; a signed-out model naming an account tool anyway is refused and the tool never runs; invalid arguments (a non-integer `order_id`) become an error result, not a crash; numeric-string/missing/dict argument shapes are all accepted; a failing tool handler is reported without leaking its exception text; **an identical repeated tool call is executed only once**; calls beyond the per-step cap are skipped but every call still gets a response message; the step cap forces a final tools-off answer; an empty model reply gets a safe fallback; a natural-language product query is cleaned into the right keywords and a `Decimal` price.
-- **The tools directly:** search-term cleaning (stopwords, plurals, non-alphanumeric input); no tool schema exposes a customer identifier; schemas are flattened (no `title`, no `anyOf`/`null`) for a small model to follow reliably; an oversized result is rejected rather than sent.
-- **The LLM wrapper:** 429 → 503 with no retry; a transient 500 is retried once and succeeds; two 500s become 503; non-5xx client errors (402, 405) are not retried; a network error is retried; the `tools` kwarg is only sent when tools are provided, and `temperature`/`tool_choice` are set correctly.
-
-### 10.2 Live, manual (against the real Docker stack and the real LLM)
+### 10.2 Live (real Docker stack and model)
 
 | Scenario | Result |
 |---|---|
-| Anonymous FAQ question ("under $10/month") | Answered from the FAQ text directly — **did not call `search_products`**, even though the tool was offered and relevant (see limitation, §12) |
-| Anonymous question the FAQ can't answer ("backup drive, how many in stock") | Correctly called `search_products`; correct price/stock in the answer |
-| Signed in, own order status | Correctly called `get_order`, correct data |
-| Signed in, "what have I ordered" (no order number given) | Correctly called `list_my_orders` |
-| Signed in, asking about another customer's order number | `get_order` correctly returned "not found"; nothing leaked |
-| Signed in, open tickets | Correctly called `list_my_tickets`, including a ticket created via the REST API |
-| Signed out, a ticket question with no trigger phrase ("do I have any open tickets?") | The regex gate missed it (no "my ticket" match) and it reached the model — **but** the model was offered no ticket tool (signed out), so it correctly declined with no data exposure. Confirms the gate is a UX nicety, not the security boundary. |
+| WebSocket conversation with a follow-up ("how many are in stock?") | Resolved from the earlier turn |
+| "What kinds of products do you sell?" / "books by Maya Rivera" / "clothing under $30 in stock" | Correct tools and answers |
+| "Is the USB-C hub available?" | Initially "not listed" (sold out, filtered); fixed — now "currently sold out" |
+| "I want to buy 2 black T-shirts in M… go ahead" | Quoted only (no order in the same turn); first try picked size L, fixed via prompt; retry correct |
+| Order form endpoints | Wrong total refused, changed variant/quantity placed, second confirm refused |
+| "I'd like to order a hoodie" | Form shown immediately after the worked-example prompt change |
+| Variant ordering and cancel via REST | Missing variant 422, sold-out 409, stock 20 → 18 → 20 |
+| "Order the T-shirt in white" | Bot picked the white M variant; form listed all four variants |
+| Token failover | Token 1 at 402 → request served by token 2 |
 
-### 10.3 Model comparison for tool-calling reliability (this is why the model changed)
-
-Tested by sending each candidate the same four questions with the real tool schemas attached, via `docker compose exec app python -c ...` against the live HF router — not assumed from documentation.
-
-| Model (provider) | Result |
-|---|---|
-| `microsoft/phi-4` (all providers) | **Cannot do tool calling at all.** Its `deepinfra` listing reports `supports_tools: false`; a request with a `tools` list failed. This is the model used everywhere else in this project before now. |
-| `Qwen/Qwen2.5-72B-Instruct` (`deepinfra`/`novita`) | Correctly chose `get_order` for an order-status question, correctly chose no tool for a password-reset question, correctly chose `list_my_orders` for "what did I buy", correctly chose `search_products` with `max_price: 10` for a price-constrained question. Adopted as the new default. |
-| `meta-llama/Llama-3.1-8B-Instruct` (`deepinfra`) | Unreliable: invented a tool call with a fabricated `order_id: 12345` for a question that needed no tool at all, and re-called the same tool a second time instead of answering after receiving its result. Rejected. |
-| `openai/gpt-oss-20b` | Untestable — the HF account returned `402 Payment Required` for every call to it during testing. |
-
-**Also discovered while testing:** the router's own model listing (`https://router.huggingface.co/v1/models`) shows **zero** providers with `is_free: true`, for any model, at the time of testing. Every provider tested (`featherless-ai`, `deepinfra`, `novita`) is paid. This directly contradicts this project's own earlier documentation, which called the setup "free tier" throughout — that was an unverified assumption, now corrected everywhere it appeared.
-
-### 10.4 Regression (from before tool calling)
-
-Re-confirmed still working after the rewrite: 97 API-level checks (products/orders/tickets CRUD, ownership, stock concurrency), the auth flows (registration normalization/uniqueness, login timing-safety, token rejection cases), and the Alembic migration path on both a fresh and an upgraded database. Not re-run as part of this change (no schema or auth code changed), but nothing in this change touches those paths.
+### 10.3 Model comparison for tool calling
+`phi-4`: no provider supports tools. `Qwen2.5-72B-Instruct`: correct tool (or none) on every test question — adopted. `Llama-3.1-8B-Instruct`: invented tool calls and looped — rejected.
 
 ---
 
@@ -424,80 +425,75 @@ Re-confirmed still working after the rewrite: 97 API-level checks (products/orde
 
 | Issue | Root cause | Resolution |
 |---|---|---|
-| `pip install` blocked | Debian/Ubuntu managed Python | Project `.venv` |
-| HF `403` / `400 model_not_supported` | Missing token scope; model not hosted by a provider | Recreated the token; switched to `phi-4` |
-| Couldn't set up local Postgres | No sudo password | Postgres in Docker |
+| `pip install` blocked | Managed system Python | Project `.venv` |
+| HF `403` / `400 model_not_supported` | Missing token scope; unhosted model | New token; model switch |
 | Ports 5433 / 8000 in use | Other projects' containers | DB port unpublished; API on 8020 |
-| "vector type not found" at startup | `documents` table created only by the seed | `VectorKnowledgeBase` self-provisions |
-| Email with spaces rejected at registration | Pattern check ran before the trim/lower-case validator | Normalizer made `mode="before"` |
-| Regex backtracking risk | Overlapping classes / adjacent `\s*` on anonymous input | Bounded quantifiers; question capped at 2000 chars |
-| `alembic check` reported drift | `orders.status` is `TEXT` in the legacy table but was modelled as `String(16)` | Model changed to `Text` to match |
-| Alembic warned "Did not recognize type 'vector'" | Reflecting the pgvector `documents` table | Filter it out *before* reflection with `include_name` (not `include_object`) |
-| Two `/chat` calls returned a bare 500 | The HF tier returned a 429 and a dropped response; the API let the exception escape | Retry once on transient errors, no retry on 429, clean 503 + `Retry-After` |
-| Test failures on a fresh DB | My own tests assumed the legacy inactive products from the upgraded DB; one even deleted `FREE-PLAN` | Tests now create their own fixtures; DB reset and rerun (97/97) |
-| Product search for "backup" matched all plans | Search intentionally covers descriptions, which mention "daily backups" | Not a bug — test expectation corrected |
-| **`phi-4` rejected requests with a `tools` list (405/no structured tool_calls)** | Its providers don't support tool calling (`supports_tools: false`/unset) | Tested three models empirically against the router rather than assuming; switched default to `Qwen2.5-72B-Instruct` pinned to `deepinfra` |
-| **"Free tier" was wrong throughout this project's own docs** | Never actually verified against the router's pricing data; `huggingface_hub`'s docs use "Inference Providers" branding that reads as free | Queried `https://router.huggingface.co/v1/models` directly: zero providers report `is_free: true` for any model. Corrected in `.env.example`, README, TECH_STACK.md and here |
-| **`db` container had stopped** (unrelated to this change) mid-testing, producing a `500` with a DNS-resolution traceback | The container had exited roughly an hour earlier for an unrelated reason | `docker compose up -d db`; not a code bug, flagged to the user rather than silently worked around |
-| **A live test got a `503` under real load** | The account hit a `429` from the provider after a burst of test traffic | Correct behaviour, not a bug — `llm.py` is designed to turn a 429 into exactly this; confirmed by retrying after a pause |
-| Test expected `search_terms("plans under 10 dollars a month")` to keep `"10"` | Numbers are deliberately dropped from keyword search (they belong in `max_price`, and as a bare keyword `"10"` would match noise like "100GB") | Test expectation corrected, not the code |
+| "vector type not found" | Table created only by the seed | Knowledge base self-provisions |
+| `phi-4` couldn't call tools | Providers lack tool support | Tested 3 models; switched to Qwen2.5-72B |
+| "Free tier" stated in docs | Never verified | Router listing checked: no free providers; docs corrected |
+| Follow-up questions ignored history | FAQ text in the latest user message dominated "it" | FAQ moved to the system message; previous question added to FAQ search |
+| **App wouldn't start after a rebuild** (`No module named 'psycopg'`) | Unpinned SQLAlchemy upgraded to 2.1, whose default PG driver is psycopg 3 | `sqlalchemy_url()` names `psycopg2` |
+| `FOR UPDATE` with the new joined type relationship | Postgres refuses `FOR UPDATE` on the nullable side of an outer join; would also lock the shared type row | `innerjoin=True`; `with_for_update(of=Product)` |
+| Product type schema edits could race with product writes | Validation read the schema unlocked | Product writes share-lock the type row; type updates take an exclusive lock |
+| "Backup drive" search returned the Free plan | OR-matching sorted by price; plan text mentions "backups" | Rank by number of matching terms |
+| Sold-out hub reported as "not listed" | Model filtered to in-stock for "available?" | Tool reports `sold_out_matches` when filtering |
+| "Yes, cancel it" would be rejected | "cancel" was in the negative-word list | Per-action confirmation patterns |
+| Tool guard test failed on a description | Parameter text mentioned "customer" | Reworded (the guard is intentional) |
+| Chat failures looked like random 503s | Provider errors weren't logged; real cause was `402` (credits used up) | Errors logged; token failover added |
+| Second token returned 403 | Missing "Inference Providers" permission | Permission added by the user |
+| Bot quoted size L for "size M" | Model picked the wrong variant SKU | Prompt rule to match size/colour/format |
+| Bot asked "which size?" instead of showing the form | An older "ask if unclear" rule; quote seen as risky | Prompt + tool description changed; worked example added |
+| Reply was a bare "[Order Form]" | Model said almost nothing when a form was attached | Standard sentence substituted |
+| **Variant silently ignored** when ordering a product without variants | `create_order` didn't reject an unknown variant SKU | Now refused; caught by a new test |
+| `load_dotenv()` failed in piped scripts | It inspects the calling frame | Container already has the env; not needed |
 
 ---
 
 ## 12. Known Limitations and Open Items
 
 **Security**
+1. No rate limiting on login/registration; registration open to anyone.
+2. Plain HTTP in the dev stack.
+3. No token revocation, refresh, logout, password change/reset or email verification.
+4. Admins only via the seed or the database; no audit log.
+5. Customer isolation lives in application code (consider Row-Level Security).
+6. Single symmetric JWT key (HS256).
+7. Tool results are untrusted text; mitigated by the prompt, and write actions additionally need server-checked confirmation.
 
-1. **No brute-force protection** on `/auth/login` and `/auth/register` (no rate limiting or lockout); registration is open to anyone.
-2. **Plain HTTP** in the dev stack — passwords and tokens would travel in cleartext without TLS.
-3. **No token revocation or refresh.** A stolen JWT works until it expires; there's no password-change or logout endpoint.
-4. **No email verification or password reset.**
-5. **Admin bootstrapping is manual.** The only way to get an admin is the seed script (or editing the database). There is deliberately no API to grant admin, but also no admin-management tooling and no audit log of admin actions.
-6. **Isolation is enforced in application code.** Every tool and query filters by `customer_id`. Consider Postgres Row-Level Security as defence in depth.
-7. **Symmetric JWT key** (HS256, single shared secret).
-8. **Tool results reach the model as untrusted data** (e.g. a ticket's own `description` field). The system prompt tells the model not to follow instructions found inside them; this is a prompt-level mitigation, not an enforced guarantee. No tool currently returns free text a customer doesn't already own, which limits the blast radius today, but this needs re-evaluating before any tool exposes other customers' free-text fields (e.g. shared ticket threads).
-
-**Store back-end**
-
-9. **No payments.** Orders are records only; nothing charges anyone, and `pending → processing → completed` is driven manually by an admin.
-10. **Ordering doesn't change `customers.plan`.** Buying "Pro plan" leaves the customer's `plan` field as it was; plans and products aren't linked.
-11. **No shipping/address, tax, discounts, currency or refunds.** Everything is a single implicit currency.
-12. **Customers can't edit or delete orders/tickets** beyond cancelling/closing; there are no ticket comments/replies.
-13. **Exact stock levels are public** (`stock_quantity` on product reads, and `search_products`'s `units_left`). Hide it behind `in_stock`/`availability` only if inventory is sensitive.
-14. **No stock reservation timeout.** Stock is decremented at order time; abandoned `pending` orders keep it held until cancelled.
-15. **Legacy products.** Migrated orders point at inactive "legacy" products; they can't be deleted (409) and clutter `include_inactive` listings.
-16. **Migration `0002` is irreversible** and its CHECK constraints would fail on a database that already holds unexpected status values.
-17. **Migrations run at app startup.** Fine for one instance; with several, run them as a separate deploy step to avoid races.
+**Store**
+8. No payments, shipping addresses, tax, discounts, currency or refunds; buying a plan doesn't change `customers.plan`.
+9. Exact stock levels are public.
+10. Stock is held by pending orders until cancelled; no reservation timeout.
+11. **Variants in JSONB:** SKU uniqueness and references are enforced by the app (advisory locks), not the database; removing a variant that's on orders prevents restocking on cancel (deactivate instead); price filters use the product's base price.
+12. Legacy rows: migrated orders point at inactive legacy products; converted per-size products remain as inactive `…-OLD<id>` rows.
+13. Migration `0002` is irreversible; migrations run at startup.
 
 **Chatbot**
-
-18. **The model sometimes skips an available tool.** Observed live: a product-pricing question that happened to also be covered by the retrieved FAQ text was answered from the FAQ without calling `search_products`, even with the tool offered. The always-included FAQ context gives the model an escape hatch from calling a tool for data that should authoritatively come from the live table. If database data must always win for a given topic, that topic likely needs to be removed from `faq.md` so the tool is the only source.
-19. **`sources` can be misleading** — the top-`k` FAQ chunks are always retrieved and listed regardless of whether the final answer used them or came entirely from a tool.
-20. **Signed-out gate is regex-based.** A signed-out user can phrase an account question without trigger phrases (confirmed live, §10.2); this is **not** a data leak — no account tool is ever offered to an anonymous caller — just a less helpful answer than the canned login prompt.
-21. **No conversation memory.** Each `/chat` call is independent, including the tool-calling loop within it; a follow-up question starts over.
-22. **Retrieval ranking on short generic queries** with the small embedding model can put the best FAQ chunk 2nd–3rd.
-23. **The model can still misread, omit, or (per §10.3) simply not call a tool for data it should have looked up.** The live scenarios in §10.2 were judged by hand, not asserted by tests. Consider the planned confidence/groundedness checks and an answer-quality test set that specifically checks *which* tool was called, not just whether the final answer sounds right.
-24. **The LLM is billed per token, and tool calling costs noticeably more per question than the old single-call design** (each round-trip resends the full history and every tool schema). Budget accordingly; watch for `402`.
-25. **Tool-calling reliability is provider-dependent, not just model-dependent** (§10.3) — the same model id can behave differently, or not support tools at all, depending which provider serves it. Re-verify against the live router before changing `LLM_MODEL`/`LLM_PROVIDER`.
+14. The "clear yes" check is English-only.
+15. WebSocket history lives in memory (lost on restart/reconnect; the page doesn't resend it).
+16. The signed-out gate is regex-based and also blocks policy questions containing "my order" (e.g. "Can I cancel my order after it starts processing?").
+17. The model may still skip a tool, pick the wrong variant (the quote/form makes this visible before anything is ordered), or ask a question instead of showing the form for vague requests.
+18. `sources` lists retrieved FAQ files even when the answer came from a tool.
+19. Small English embedding model; full FAQ re-index on every startup.
+20. Every message costs HF credits; tool calls multiply it.
+21. The FAQ's store policies (shipping prices, return window, payment methods) are placeholders to replace with real ones.
 
 **Engineering**
-
-26. **`VectorKnowledgeBase` still opens its own psycopg2 connections** per call (the ORM layer is pooled).
-27. **Full FAQ re-index on every startup.**
-28. **Dev-mode container** (`--reload`, whole-project bind mount).
-29. **Demo credentials** are random and printed once; the seed is for local demo data only.
-30. **No CI** — the new pytest suite runs locally/manually only; it isn't wired into any pipeline yet.
+22. The vector store uses its own (unpooled) connections.
+23. Dev-mode container (`--reload`, bind mount, hardcoded DB password).
+24. No CI; tests run manually.
+25. Unpinned major versions in `requirements.txt` (the SQLAlchemy 2.1 incident).
 
 ---
 
 ## 13. Suggested Next Steps
 
-1. **Rate limiting / lockout** on login and registration; **TLS**.
-2. **More tools, carefully** — `cancel_order`/`create_ticket` are natural next tools, but as mutating actions they need an explicit confirmation step before executing, unlike the read-only tools here.
-3. **Wire the pytest suite into CI**, and extend it to the REST API's 97 existing manual checks so they stop being an ad-hoc script.
-4. **Payments and order flow** — a payment provider, and tie a purchased plan to `customers.plan`.
-5. **Admin tooling** — manage admins, audit log of product/order/tool actions.
-6. **Router + confidence/groundedness check** before answering; escalate low-confidence answers to a human. Would also help catch the "skipped an available tool" failure mode in limitation 18.
-7. **Conversation history** for follow-up questions.
-8. **Password change/reset, email verification, token refresh/revocation.**
-9. **Row-Level Security**, connection pooling for the vector store, and a production container image.
+1. **Before real customers:** rate limiting, TLS, token refresh/revocation, password reset.
+2. **WhatsApp channel** (Meta Cloud API): verified phone-number linking, Postgres-stored conversation history, webhook signature checks.
+3. **Persist conversation history** for the WebSocket too, so reconnects keep context.
+4. **Loosen the signed-out gate** so general policy questions are answered and only real lookups require login.
+5. **Server-side fallback** that creates the order form whenever purchase intent is clear and a product was found, regardless of the model's choice.
+6. **Payments** and linking purchased plans to `customers.plan`.
+7. **Admin tooling and audit log**; CI running the test suite.
+8. **Pin dependency majors**; production container image; pooled connections for the vector store.
+9. Consider a `product_variants` table if the catalog grows large or other systems write to the database directly.

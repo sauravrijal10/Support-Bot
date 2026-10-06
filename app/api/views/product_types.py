@@ -8,7 +8,7 @@ from app.api.views.base import APIView, route
 from app.api.views.products import FOREIGN_KEY_VIOLATION, UNIQUE_VIOLATION, _is_admin, _pgcode
 from app.models import Product, ProductType
 from app.schemas.product_type import ProductTypeCreate, ProductTypeOut, ProductTypeUpdate
-from app.services.catalog import attribute_errors
+from app.services.catalog import variant_errors
 
 DUPLICATE_SLUG = "A product type with this slug already exists"
 
@@ -82,7 +82,7 @@ class ProductTypeView(APIView):
             products = session.scalars(
                 select(Product).where(Product.product_type_id == type_id).order_by(Product.id)
             ).all()
-            broken = [(p.sku, attribute_errors(schema, p.attributes)) for p in products]
+            broken = [(p.sku, variant_errors(schema, p.attributes, p.variants, p.sku)) for p in products]
             broken = [(sku, errors) for sku, errors in broken if errors]
             if broken:
                 sku, errors = broken[0]

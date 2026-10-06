@@ -32,7 +32,7 @@ from app.db.session import sqlalchemy_url  # noqa: E402
 from app.models import Customer, Order, Product, ProductType, Ticket  # noqa: E402
 from app.schemas.product_type import ProductTypeCreate  # noqa: E402
 from app.services.auth import hash_password  # noqa: E402
-from app.services.catalog import validate_attributes  # noqa: E402
+from app.services.catalog import validate_product, variant_errors  # noqa: E402
 from app.services.orders import create_order  # noqa: E402
 
 ADA = "ada@example.com"
@@ -62,19 +62,20 @@ DEMO_PRODUCT_TYPES = [
         "description": "Drives, peripherals and audio.",
         "attribute_schema": [
             {"key": "brand", "label": "Brand", "type": "text", "required": True},
-            {"key": "model", "label": "Model", "type": "text"},
+            {"key": "capacity", "label": "Capacity", "type": "text", "variant": True},
+            {"key": "model", "label": "Model", "type": "text", "variant": True},
+            {"key": "color", "label": "Colour", "type": "text", "variant": True},
             {"key": "warranty_months", "label": "Warranty", "type": "integer", "unit": "months"},
-            {"key": "color", "label": "Colour", "type": "text"},
             {"key": "wireless", "label": "Wireless", "type": "boolean"},
         ],
     },
     {
         "slug": "clothing", "name": "Clothing",
-        "description": "Acme apparel. Each size/colour is its own SKU.",
+        "description": "Acme apparel, in several sizes and colours.",
         "attribute_schema": [
-            {"key": "size", "label": "Size", "type": "choice", "required": True,
+            {"key": "size", "label": "Size", "type": "choice", "required": True, "variant": True,
              "options": ["XS", "S", "M", "L", "XL", "XXL", "One size"]},
-            {"key": "color", "label": "Colour", "type": "text", "required": True},
+            {"key": "color", "label": "Colour", "type": "text", "required": True, "variant": True},
             {"key": "material", "label": "Material", "type": "text"},
             {"key": "fit", "label": "Fit", "type": "choice", "options": ["Men", "Women", "Unisex"]},
         ],
@@ -84,7 +85,7 @@ DEMO_PRODUCT_TYPES = [
         "description": "Printed books and e-books.",
         "attribute_schema": [
             {"key": "author", "label": "Author", "type": "text", "required": True},
-            {"key": "format", "label": "Format", "type": "choice", "required": True,
+            {"key": "format", "label": "Format", "type": "choice", "required": True, "variant": True,
              "options": ["Paperback", "Hardcover", "E-book"]},
             {"key": "pages", "label": "Pages", "type": "integer"},
             {"key": "publisher", "label": "Publisher", "type": "text"},
@@ -102,9 +103,10 @@ DEMO_PRODUCT_TYPES = [
     },
     {
         "slug": "gift-cards", "name": "Gift cards",
-        "description": "Store credit for anything at Acme Store.",
+        "description": "Store credit for anything at Digi Store.",
         "attribute_schema": [
-            {"key": "delivery", "label": "Delivery", "type": "choice", "required": True,
+            {"key": "amount", "label": "Amount", "type": "integer", "unit": "USD", "variant": True},
+            {"key": "delivery", "label": "Delivery", "type": "choice", "required": True, "variant": True,
              "options": ["Email", "Post"]},
             {"key": "valid_months", "label": "Valid for", "type": "integer", "unit": "months"},
         ],
@@ -112,12 +114,20 @@ DEMO_PRODUCT_TYPES = [
 ]
 
 
-def _p(type_slug, sku, name, description, price, attributes, stock=None, period="one_time", active=True):
+def _p(type_slug, sku, name, description, price, attributes, stock=None, period="one_time",
+       active=True, variants=()):
     return {
         "type": type_slug, "sku": sku, "name": name, "description": description,
         "price": Decimal(price), "attributes": attributes, "stock_quantity": stock,
-        "billing_period": period, "is_active": active,
+        "billing_period": period, "is_active": active, "variants": list(variants),
     }
+
+
+def _v(sku, options, price=None, stock=None, active=True):
+    """A variant. If a standalone product with this SKU exists from before
+    variants (e.g. TSHIRT-LOGO-BLK-M), its stock carries over."""
+    return {"sku": sku, "options": options, "price": None if price is None else Decimal(price),
+            "stock_quantity": stock, "is_active": active}
 
 
 # stock=None means unlimited (digital goods); 0 means sold out.
@@ -134,10 +144,11 @@ DEMO_PRODUCTS = [
     _p("digital-services", "ADDON-500GB", "Extra 500GB storage add-on", "Adds 500GB of storage to any plan.",
        "25.00", {"storage_gb": 500}),
     # --- electronics
-    _p("electronics", "DRIVE-1TB", "Acme Backup Drive 1TB", "Physical 1TB drive for local backups. Ships worldwide.",
-       "89.00", {"brand": "Acme", "model": "ABD-1T", "warranty_months": 24, "color": "Black"}, stock=10),
-    _p("electronics", "DRIVE-4TB", "Acme Backup Drive 4TB", "Physical 4TB drive for local backups, USB-C. Ships worldwide.",
-       "179.00", {"brand": "Acme", "model": "ABD-4T", "warranty_months": 36, "color": "Black"}, stock=6),
+    _p("electronics", "DRIVE-BACKUP", "Acme Backup Drive", "Physical drive for local backups, USB-C. Ships worldwide.",
+       "89.00", {"brand": "Acme", "warranty_months": 24}, variants=[
+           _v("DRIVE-1TB", {"capacity": "1TB", "model": "ABD-1T", "color": "Black"}, "89.00", stock=10),
+           _v("DRIVE-4TB", {"capacity": "4TB", "model": "ABD-4T", "color": "Black"}, "179.00", stock=6),
+       ]),
     _p("electronics", "MOUSE-WL", "Silent wireless mouse", "Quiet clicks, 18-month battery life, works with any laptop.",
        "29.99", {"brand": "Nimbus", "model": "SM-200", "warranty_months": 12, "color": "Grey", "wireless": True}, stock=40),
     _p("electronics", "HUB-USBC-7", "USB-C hub 7-in-1", "HDMI 4K, 3x USB-A, SD/microSD, 100W pass-through charging.",
@@ -149,12 +160,19 @@ DEMO_PRODUCTS = [
     _p("electronics", "MONITOR-27-4K", '27" 4K monitor', "27-inch IPS, 3840x2160, USB-C with 65W charging.",
        "349.00", {"brand": "Vistar", "model": "V27U", "warranty_months": 36, "color": "Black"}, stock=4),
     # --- clothing
-    _p("clothing", "TSHIRT-LOGO-BLK-M", "Acme logo T-shirt (black, M)", "Soft organic cotton tee with the Acme logo.",
-       "24.00", {"size": "M", "color": "Black", "material": "Organic cotton", "fit": "Unisex"}, stock=30),
-    _p("clothing", "TSHIRT-LOGO-BLK-L", "Acme logo T-shirt (black, L)", "Soft organic cotton tee with the Acme logo.",
-       "24.00", {"size": "L", "color": "Black", "material": "Organic cotton", "fit": "Unisex"}, stock=25),
-    _p("clothing", "HOODIE-GRY-L", "Zip hoodie (grey, L)", "Heavyweight brushed-fleece zip hoodie.",
-       "59.00", {"size": "L", "color": "Grey", "material": "Cotton/polyester fleece", "fit": "Unisex"}, stock=12),
+    _p("clothing", "TSHIRT-LOGO", "Acme logo T-shirt", "Soft organic cotton tee with the Acme logo.",
+       "24.00", {"material": "Organic cotton", "fit": "Unisex"}, variants=[
+           _v("TSHIRT-LOGO-BLK-M", {"size": "M", "color": "Black"}, stock=30),
+           _v("TSHIRT-LOGO-BLK-L", {"size": "L", "color": "Black"}, stock=25),
+           _v("TSHIRT-LOGO-WHT-M", {"size": "M", "color": "White"}, stock=20),
+           _v("TSHIRT-LOGO-WHT-L", {"size": "L", "color": "White"}, stock=0),
+       ]),
+    _p("clothing", "HOODIE-ZIP", "Zip hoodie", "Heavyweight brushed-fleece zip hoodie.",
+       "59.00", {"material": "Cotton/polyester fleece", "fit": "Unisex"}, variants=[
+           _v("HOODIE-GRY-M", {"size": "M", "color": "Grey"}, stock=10),
+           _v("HOODIE-GRY-L", {"size": "L", "color": "Grey"}, stock=12),
+           _v("HOODIE-NVY-L", {"size": "L", "color": "Navy"}, "62.00", stock=6),
+       ]),
     _p("clothing", "JACKET-RAIN-NVY-M", "Packable rain jacket (navy, M)", "Waterproof, breathable, packs into its own pocket.",
        "89.00", {"size": "M", "color": "Navy", "material": "Recycled nylon", "fit": "Women"}, stock=8),
     _p("clothing", "SOCKS-RUN-3PK", "Running socks, 3-pack", "Cushioned, moisture-wicking running socks.",
@@ -163,7 +181,10 @@ DEMO_PRODUCTS = [
        "19.00", {"size": "One size", "color": "Navy", "material": "Cotton twill", "fit": "Unisex"}, stock=35),
     # --- books (fictional titles)
     _p("books", "BOOK-BACKUP-HANDBOOK", "The Backup Handbook", "A practical guide to backing up everything that matters.",
-       "34.99", {"author": "Maya Rivera", "format": "Paperback", "pages": 312, "publisher": "Acme Press"}, stock=20),
+       "34.99", {"author": "Maya Rivera", "pages": 312, "publisher": "Acme Press"}, variants=[
+           _v("BOOK-BACKUP-HANDBOOK-PB", {"format": "Paperback"}, "34.99", stock=20),
+           _v("BOOK-BACKUP-HANDBOOK-EBOOK", {"format": "E-book"}, "14.99"),
+       ]),
     _p("books", "BOOK-CLOUD-BASICS", "Cloud Storage Basics", "A short, friendly introduction to how cloud storage works.",
        "12.99", {"author": "Priya Nair", "format": "E-book", "pages": 180, "publisher": "Acme Press"}),
     _p("books", "BOOK-QUIET-SERVERS", "The Quiet Servers", "A novel about a night-shift engineer and a data centre that keeps secrets.",
@@ -182,16 +203,62 @@ DEMO_PRODUCTS = [
     _p("home-kitchen", "KETTLE-CLASSIC", "Classic stovetop kettle", "Discontinued -- kept for order history.",
        "45.00", {"brand": "Hearth", "material": "Enamelled steel", "capacity_ml": 1700}, stock=0, active=False),
     # --- gift cards
-    _p("gift-cards", "GIFT-25-EMAIL", "$25 e-gift card", "Delivered by email within minutes.",
-       "25.00", {"delivery": "Email", "valid_months": 24}),
-    _p("gift-cards", "GIFT-50-EMAIL", "$50 e-gift card", "Delivered by email within minutes.",
-       "50.00", {"delivery": "Email", "valid_months": 24}),
-    _p("gift-cards", "GIFT-100-POST", "$100 gift card (posted)", "A printed card in a gift envelope, posted to you.",
-       "100.00", {"delivery": "Post", "valid_months": 24}, stock=100),
+    _p("gift-cards", "GIFT-CARD", "Digi Store gift card",
+       "E-gift cards arrive by email within minutes; posted cards come in a gift envelope.",
+       "25.00", {"valid_months": 24}, variants=[
+           _v("GIFT-25-EMAIL", {"amount": 25, "delivery": "Email"}, "25.00"),
+           _v("GIFT-50-EMAIL", {"amount": 50, "delivery": "Email"}, "50.00"),
+           _v("GIFT-100-POST", {"amount": 100, "delivery": "Post"}, "100.00", stock=100),
+       ]),
 ]
 
 # The type the 0003 migration put pre-existing products in.
 FALLBACK_TYPE = "general"
+
+
+def _fields(spec: dict, product_type: ProductType, variants: list[dict]) -> dict:
+    """Product columns from a spec, attributes/variants validated against the type."""
+    fields = {k: v for k, v in spec.items() if k not in ("type", "variants")}
+    fields["attributes"], fields["variants"] = validate_product(
+        product_type.attribute_schema, spec["attributes"], variants, spec["sku"], product_type.name
+    )
+    if fields["variants"]:
+        fields["stock_quantity"] = None  # stock is per variant
+    return fields
+
+
+def _absorb_standalone_products(session, variants: list[dict], carry: dict | None = None) -> dict:
+    """Before variants, each size/format was its own product (e.g. SKU
+    TSHIRT-LOGO-BLK-M). For each variant whose SKU such a product still
+    holds: carry its stock over, then rename and deactivate it (it stays for
+    the order history that points at it)."""
+    carry = dict(carry or {})
+    absorbed = 0
+    for v in variants:
+        old = session.scalar(select(Product).where(Product.sku == v["sku"], Product.variants == []))
+        if old is None:
+            continue
+        carry.setdefault(v["sku"], old.stock_quantity)
+        old.sku = f"{old.sku}-OLD{old.id}"[:64]
+        old.is_active = False
+        absorbed += 1
+    session.flush()
+    out = [{**v, "stock_quantity": carry[v["sku"]]} if v["sku"] in carry else v for v in variants]
+    return {"list": out, "absorbed": absorbed}
+
+
+def _upgrade_type_for_variants(session, product_type: ProductType, schema: list[dict]) -> bool:
+    """A demo type created before variants existed gets the new schema (with
+    "variant" flags), if every product it has would still be valid."""
+    if any(a.get("variant") for a in product_type.attribute_schema) or not any(
+        a.get("variant") for a in schema
+    ):
+        return False
+    products = session.scalars(select(Product).where(Product.product_type_id == product_type.id))
+    if any(variant_errors(schema, p.attributes, p.variants, p.sku) for p in products):
+        return False
+    product_type.attribute_schema = schema
+    return True
 
 
 def new_password() -> str:
@@ -203,7 +270,7 @@ def main():
     engine = create_engine(sqlalchemy_url(os.environ["DATABASE_URL"]))
     issued: dict[str, str] = {}
     warnings: list[str] = []
-    counts = {"types": 0, "products": 0, "recategorised": 0}
+    counts = {"types": 0, "types_upgraded": 0, "products": 0, "recategorised": 0, "converted": 0}
 
     with Session(engine) as session:
         # --- customers ----------------------------------------------------
@@ -237,48 +304,57 @@ def main():
         types: dict[str, ProductType] = {}
         for spec in DEMO_PRODUCT_TYPES:
             definition = ProductTypeCreate.model_validate(spec)
+            schema = [a.model_dump(exclude_none=True) for a in definition.attribute_schema]
             product_type = session.scalar(select(ProductType).where(ProductType.slug == definition.slug))
             if product_type is None:
-                data = definition.model_dump()
-                data["attribute_schema"] = [
-                    a.model_dump(exclude_none=True) for a in definition.attribute_schema
-                ]
-                product_type = ProductType(**data)
+                product_type = ProductType(**{**definition.model_dump(), "attribute_schema": schema})
                 session.add(product_type)
                 counts["types"] += 1
-            # An existing type is left alone: an admin may have edited it.
+            elif _upgrade_type_for_variants(session, product_type, schema):
+                counts["types_upgraded"] += 1
+            # Otherwise an existing type is left alone: an admin may have edited it.
             types[definition.slug] = product_type
         session.flush()
 
         # --- products -----------------------------------------------------
         for spec in DEMO_PRODUCTS:
             product_type = types[spec["type"]]
-            fields = {k: v for k, v in spec.items() if k != "type"}
-            fields["attributes"] = validate_attributes(
-                product_type.attribute_schema, spec["attributes"], product_type.name
-            )
             product = session.scalar(select(Product).where(Product.sku == spec["sku"]))
             if product is None:
-                session.add(Product(**fields, product_type=product_type))
+                variants = _absorb_standalone_products(session, spec["variants"])
+                counts["converted"] += variants["absorbed"]
+                session.add(Product(**_fields(spec, product_type, variants["list"]), product_type=product_type))
                 counts["products"] += 1
-            elif product.product_type.slug == FALLBACK_TYPE:
+            elif product.product_type.slug == FALLBACK_TYPE and not spec["variants"]:
                 product.product_type = product_type
-                product.attributes = fields["attributes"]
+                product.attributes = _fields(spec, product_type, [])["attributes"]
                 counts["recategorised"] += 1
+            elif spec["variants"] and not product.variants:
+                # Same SKU, now with variants (e.g. a book gaining an e-book
+                # edition): the product's own stock goes to its first variant.
+                variants = _absorb_standalone_products(
+                    session, spec["variants"], carry={spec["variants"][0]["sku"]: product.stock_quantity}
+                )
+                fields = _fields(spec, product_type, variants["list"])
+                product.product_type = product_type
+                product.attributes, product.variants = fields["attributes"], fields["variants"]
+                product.stock_quantity = None
+                counts["converted"] += 1 + variants["absorbed"]
         session.flush()
 
         # --- orders and tickets (only on an empty database) ---------------
         if session.scalar(select(Order.id).limit(1)) is None:
             products = {p.sku: p for p in session.scalars(select(Product))}
-            ada_order = create_order(session, customers[ADA].id, [(products["PRO-ANNUAL"].id, 1)])
+            ada_order = create_order(session, customers[ADA].id, [(products["PRO-ANNUAL"].id, None, 1)])
             ada_order.status = "completed"
-            grace_order = create_order(session, customers[GRACE].id, [(products["ADDON-500GB"].id, 1)])
+            grace_order = create_order(session, customers[GRACE].id, [(products["ADDON-500GB"].id, None, 1)])
             grace_order.status = "processing"
             create_order(
                 session, customers[ADA].id,
-                [(products["BOOK-BACKUP-HANDBOOK"].id, 1), (products["TSHIRT-LOGO-BLK-M"].id, 2)],
+                [(products["BOOK-BACKUP-HANDBOOK"].id, "BOOK-BACKUP-HANDBOOK-PB", 1),
+                 (products["TSHIRT-LOGO"].id, "TSHIRT-LOGO-BLK-M", 2)],
             )
-            headphones = create_order(session, customers[GRACE].id, [(products["HEADPHONES-NC"].id, 1)])
+            headphones = create_order(session, customers[GRACE].id, [(products["HEADPHONES-NC"].id, None, 1)])
             headphones.status = "completed"
 
         if session.scalar(select(Ticket.id).limit(1)) is None:
@@ -295,8 +371,9 @@ def main():
         session.commit()
 
     print(
-        f"Demo data ready: {counts['types']} new product type(s), {counts['products']} new "
-        f"product(s), {counts['recategorised']} existing product(s) moved to their real type."
+        f"Demo data ready: {counts['types']} new product type(s) ({counts['types_upgraded']} "
+        f"upgraded for variants), {counts['products']} new product(s), {counts['recategorised']} "
+        f"moved to their real type, {counts['converted']} turned into variants."
     )
     if issued:
         print("\nNew demo logins (shown once -- these are not stored in plain text):")

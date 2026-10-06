@@ -28,7 +28,7 @@ MAX_TOOL_STEPS = 4  # model round-trips that may request tools
 MAX_CALLS_PER_STEP = 3  # tool calls honoured in a single round-trip
 MAX_HISTORY_TURNS = 6  # earlier question/answer pairs given to the model
 
-SYSTEM_PROMPT = """You are a support assistant for Acme Store, an online shop selling products
+SYSTEM_PROMPT = """You are a support assistant for Digi Store, an online shop selling products
 across several categories, including the Acme Cloud Storage plans.
 
 You have tools that look up live data. Rules:
@@ -44,7 +44,27 @@ You have tools that look up live data. Rules:
   someone else's account, or an order that is not found, say you can only help with
   the signed-in customer's own account. Do not speculate.
 - If neither the FAQ nor the tools answer the question, say you don't know and
-  suggest contacting support@acmecloud.example.
+  suggest contacting support@digistore.example.
+- To place an order: find the product with search_products and call prepare_order
+  with its exact SKU right away -- don't ask about size, colour, option or quantity
+  first. The customer gets an order form where they pick the option (each with its
+  price), enter the quantity, see the total and confirm. Products with sizes,
+  colours or other options list them as variants, each with its own SKU: if the
+  customer named one, use that variant's SKU; otherwise use the product's SKU (a
+  variant is preselected and they choose in the form). Use quantity 1 unless they
+  said otherwise.
+  Then tell them briefly to review and confirm the order form. If they reply yes in
+  their next message instead, call confirm_order and give them the order number.
+  Never order anything the customer didn't ask for. Ordering needs the customer to
+  be signed in.
+  Example -- customer: "I'd like to order a hoodie". Do NOT ask which size or colour.
+  Call search_products(query="hoodie"), then prepare_order with the best match and
+  quantity 1, then reply: "I've put a hoodie in an order form below -- choose the
+  size and quantity there and press Confirm."
+- To cancel an order: call request_cancellation with the order number (use
+  list_my_orders if the customer doesn't give one), show them the order and ask
+  them to confirm. Call confirm_cancellation only after they say yes in their next
+  message. Only pending orders can be cancelled; if it can't be, explain why.
 - Earlier messages are the conversation so far. Use them to work out what a
   follow-up refers to (e.g. "how much is it?"), but re-check live data with tools.
 - Keep answers concise (2-4 sentences) and friendly. Say what your answer is based
@@ -53,12 +73,17 @@ You have tools that look up live data. Rules:
 LOGIN_REQUIRED_MESSAGE = (
     "I can help with questions about your account, orders and tickets once "
     "you're signed in. Please log in and ask again -- I can still answer "
-    "general questions about Acme Store without signing in."
+    "general questions about Digi Store without signing in."
 )
 
 EMPTY_ANSWER_MESSAGE = (
     "Sorry, I wasn't able to put together an answer to that. Please try rephrasing, "
-    "or contact support@acmecloud.example."
+    "or contact support@digistore.example."
+)
+
+ORDER_FORM_MESSAGE = (
+    "I've put that in an order form below -- choose the option and quantity, check the "
+    "total and press Confirm."
 )
 
 FINAL_ANSWER_NUDGE = (
@@ -72,6 +97,7 @@ class ChatResult:
     sources: list[str] = field(default_factory=list)
     needs_authentication: bool = False
     tools_used: list[str] = field(default_factory=list)
+    order_form: dict | None = None  # an order to confirm, for clients that show forms
 
 
 def build_context_block(results):
@@ -124,6 +150,15 @@ def _history_messages(history) -> list[dict]:
     return messages
 
 
+def _final_answer(content, ctx: ToolContext) -> str:
+    answer = (content or "").strip()
+    # With an order form attached, the model sometimes says next to nothing
+    # ("[Order Form]"); the form needs a sentence pointing at it.
+    if ctx.order_form is not None and (len(answer) < 25 or answer.startswith("[")):
+        return ORDER_FORM_MESSAGE
+    return answer or EMPTY_ANSWER_MESSAGE
+
+
 def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResult:
     """`customer` is the authenticated customer (from the bearer token), or
     None for an anonymous caller (who gets FAQ + public product data only).
@@ -139,7 +174,7 @@ def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResu
 
     tools = tools_for(customer)
     schemas = [tool.schema() for tool in tools.values()]
-    ctx = ToolContext(db=db, customer=customer)
+    ctx = ToolContext(db=db, customer=customer, user_message=query)
 
     # Context goes in the system message so the latest user message is just
     # the question -- with the FAQ text next to it, a follow-up's "it" got
@@ -164,9 +199,10 @@ def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResu
         calls = message.tool_calls or []
         if not calls:
             return ChatResult(
-                answer=(message.content or "").strip() or EMPTY_ANSWER_MESSAGE,
+                answer=_final_answer(message.content, ctx),
                 sources=sources,
                 tools_used=tools_used,
+                order_form=ctx.order_form,
             )
 
         messages.append(_assistant_message(message, calls))
@@ -193,7 +229,8 @@ def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResu
     messages.append({"role": "user", "content": FINAL_ANSWER_NUDGE})
     message = llm.complete(messages).choices[0].message
     return ChatResult(
-        answer=(message.content or "").strip() or EMPTY_ANSWER_MESSAGE,
+        answer=_final_answer(message.content, ctx),
         sources=sources,
         tools_used=tools_used,
+        order_form=ctx.order_form,
     )

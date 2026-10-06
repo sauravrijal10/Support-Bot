@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Acme Support Chat</title>
+<title>Digi Store Support</title>
 <style>
   :root {
     --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
@@ -74,6 +74,23 @@
   .typing .bubble { color: var(--muted); }
   .typing .bubble::after { content: "…"; animation: blink 1s steps(3) infinite; }
   @keyframes blink { 50% { opacity: .2; } }
+  .order-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px; display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 460px;
+  }
+  .order-card h3 { margin: 0; font-size: 14px; }
+  .order-line { display: grid; grid-template-columns: 1fr 76px; gap: 6px 8px; align-items: center; }
+  .order-line select { grid-column: 1 / -1; min-width: 0; }
+  .order-line select, .order-line input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px;
+  }
+  .order-line .qty-label { font-size: 13px; color: var(--muted); }
+  .order-line .line-total { grid-column: 1 / -1; font-size: 13px; color: var(--muted); text-align: right; }
+  .order-total { display: flex; justify-content: space-between; font-weight: 600; border-top: 1px solid var(--border); padding-top: 8px; }
+  .order-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .order-note { font-size: 12px; color: var(--muted); }
+  .order-note.error { color: var(--bad); }
+  .order-card.done { opacity: .75; }
   .empty { margin: auto; text-align: center; color: var(--muted); max-width: 420px; }
   .suggest { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 10px; }
   .suggest button { font-size: 13px; padding: 5px 10px; border-radius: 999px; }
@@ -89,7 +106,7 @@
 <body>
 <div class="app">
   <header>
-    <h1>Acme Support</h1>
+    <h1>Digi Store Support</h1>
     <div class="seg" role="group" aria-label="Transport">
       <button type="button" data-mode="ws" title="Stateful conversation over /ws/chat">WebSocket</button>
       <button type="button" data-mode="rest" title="One POST /chat call per question">REST</button>
@@ -191,7 +208,127 @@
       meta.append(b);
     }
     if (meta.childElementCount) m.append(meta);
+    if (data.order_form) m.append(renderOrderForm(data.order_form));
     log.append(m); scrollDown();
+  }
+
+  // ------------------------------------------------------------- order form
+
+  const PERIOD = { monthly: " / month", yearly: " / year" };
+  const cents = (price) => Math.round(parseFloat(price) * 100);
+  const money = (c) => "$" + (c / 100).toFixed(2);
+  let activeForm = null; // only the newest form can be used (the server retires older ones)
+
+  function renderOrderForm(form) {
+    if (activeForm) activeForm.retire("Replaced by a newer order form.");
+    const card = el("div", "order-card");
+    card.append(el("h3", null, "Your order"));
+    const rows = [];
+
+    for (const line of form.lines) {
+      const row = el("div", "order-line");
+      const select = el("select");
+      select.setAttribute("aria-label", "Option");
+      for (const o of line.options) {
+        const opt = el("option", null,
+          `${o.name} — $${o.unit_price}${PERIOD[o.billing_period] || ""}` + (o.max_quantity ? "" : " (sold out)"));
+        opt.value = o.sku;
+        opt.disabled = !o.max_quantity;
+        opt.selected = o.sku === line.sku;
+        select.append(opt);
+      }
+      const qtyLabel = el("label", "qty-label", "Quantity");
+      const qty = el("input");
+      qty.type = "number"; qty.min = "1"; qty.value = String(line.quantity);
+      qty.setAttribute("aria-label", "Quantity");
+      const lineTotal = el("div", "line-total");
+      row.append(select, qtyLabel, qty, lineTotal);
+      card.append(row);
+      rows.push({ select, qty, lineTotal, options: line.options });
+    }
+
+    const totalRow = el("div", "order-total");
+    const totalValue = el("span");
+    totalRow.append(el("span", null, "Total"), totalValue);
+    const note = el("div", "order-note",
+      `Prices are checked again when you confirm. This form is valid until ${new Date(form.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`);
+    const actions = el("div", "order-actions");
+    const cancelBtn = el("button", null, "Cancel"); cancelBtn.type = "button";
+    const confirmBtn = el("button", "primary", "Confirm order"); confirmBtn.type = "button";
+    actions.append(cancelBtn, confirmBtn);
+    card.append(totalRow, note, actions);
+
+    let total = 0;
+    function recalc() {
+      total = 0;
+      let valid = true;
+      for (const r of rows) {
+        const option = r.options.find((o) => o.sku === r.select.value);
+        r.qty.max = String(option.max_quantity);
+        let q = parseInt(r.qty.value, 10);
+        if (!Number.isInteger(q) || q < 1) { valid = false; q = 0; }
+        if (q > option.max_quantity) { q = option.max_quantity; r.qty.value = String(q); }
+        const line = cents(option.unit_price) * q;
+        r.lineTotal.textContent = q ? `${q} × $${option.unit_price} = ${money(line)}` : "Enter a quantity";
+        total += line;
+      }
+      totalValue.textContent = money(total);
+      confirmBtn.disabled = !valid || busy;
+    }
+
+    let busy = false;
+    function lock(message, isError) {
+      for (const r of rows) { r.select.disabled = true; r.qty.disabled = true; }
+      confirmBtn.disabled = cancelBtn.disabled = true;
+      card.classList.add("done");
+      note.className = "order-note" + (isError ? " error" : "");
+      note.textContent = message;
+      if (activeForm && activeForm.card === card) activeForm = null;
+    }
+
+    for (const r of rows) {
+      r.select.onchange = recalc;
+      r.qty.oninput = recalc;
+    }
+
+    confirmBtn.onclick = async () => {
+      busy = true; confirmBtn.disabled = cancelBtn.disabled = true;
+      note.className = "order-note"; note.textContent = "Placing your order…";
+      try {
+        const order = await api(`/orders/drafts/${form.draft_id}/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items: rows.map((r) => ({ sku: r.select.value, quantity: parseInt(r.qty.value, 10) })),
+            expected_total: (total / 100).toFixed(2),
+          }),
+        });
+        const text = `Order #${order.id} placed — total $${order.total_amount}. You can cancel it while it's pending.`;
+        lock("✅ " + text);
+        state.history.push({ question: "(confirmed the order form)", answer: text });
+      } catch (err) {
+        busy = false;
+        if (err.status === 401) { signOut("Your session expired. Please sign in again."); return; }
+        if (err.status === 404 || err.status === 409) {
+          lock(err.message + " Ask the assistant for an updated order form.", true);
+        } else {
+          note.className = "order-note error"; note.textContent = err.message;
+          cancelBtn.disabled = false; recalc();
+        }
+      }
+    };
+
+    cancelBtn.onclick = async () => {
+      confirmBtn.disabled = cancelBtn.disabled = true;
+      try {
+        await api(`/orders/drafts/${form.draft_id}/discard`, { method: "POST" });
+      } catch {}
+      lock("Order cancelled — nothing was ordered.");
+    };
+
+    recalc();
+    activeForm = { card, retire: (msg) => lock(msg) };
+    return card;
   }
 
   function addSystem(text, isError) {

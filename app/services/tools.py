@@ -10,7 +10,12 @@ SECURITY MODEL -- read before adding a tool:
   which the API layer fills from the verified login token. No argument model
   contains a customer id, and unknown arguments are dropped, so a model (or a
   prompt-injected model) that invents `customer_id` has no effect.
-* Tools are READ-ONLY. Nothing here changes data.
+* Tools are read-only, except ordering and cancelling, which are two-step:
+  `prepare_order` / `request_cancellation` only record what the customer
+  asked for; `confirm_order` / `confirm_cancellation` act on it, and the
+  server refuses unless that was shown in an earlier turn AND the customer's
+  current message is a plain "yes" (app/services/order_drafts.py,
+  order_cancellations.py). The model alone can't order or cancel anything.
 * Anonymous callers are only offered public tools, and `run_tool` re-checks
   that even if the model names a tool it wasn't offered.
 * Arguments are validated; tool failures become an error *result* the model
@@ -22,13 +27,15 @@ SECURITY MODEL -- read before adding a tool:
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
 
 from pydantic import BaseModel, Field, ValidationError
 
 from app.models.enums import OrderStatus, TicketStatus
+from app.services.order_drafts import MAX_LINES, MAX_QUANTITY_PER_LINE, is_confirmation
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +43,17 @@ MAX_RESULT_CHARS = 6000
 MAX_TEXT_CHARS = 200
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @dataclass
 class ToolContext:
     db: object
     customer: dict | None  # the AUTHENTICATED customer, or None if signed out
+    user_message: str = ""  # the customer's message this request answers
+    started_at: datetime = field(default_factory=_utcnow)  # when this request began
+    order_form: dict | None = None  # set by prepare_order; shown to the customer as a form
 
 
 # --------------------------------------------------------------------------
@@ -62,7 +76,11 @@ class SearchProductsArgs(BaseModel):
     max_price: float | None = Field(
         None, ge=0, description="Only products priced at or below this amount (USD)."
     )
-    in_stock_only: bool = Field(False, description="Only products that can be bought right now.")
+    in_stock_only: bool = Field(
+        False,
+        description="Only products that can be bought right now. Leave false when checking "
+        "whether a specific product is available, so a sold-out product is still found.",
+    )
     limit: int = Field(10, ge=1, le=10, description="Maximum products to return.")
 
 
@@ -77,6 +95,33 @@ class GetOrderArgs(BaseModel):
 class ListOrdersArgs(BaseModel):
     status: OrderStatus | None = Field(None, description="Only orders with this status.")
     limit: int = Field(10, ge=1, le=10, description="Maximum orders to return, newest first.")
+
+
+class OrderLineArgs(BaseModel):
+    sku: str = Field(
+        ..., min_length=1, max_length=64,
+        description="Exact SKU from search_products -- a variant's SKU when a specific "
+        "size/colour/option was asked for, otherwise the product's.",
+    )
+    quantity: int = Field(1, ge=1, le=MAX_QUANTITY_PER_LINE)
+
+
+class PrepareOrderArgs(BaseModel):
+    items: list[OrderLineArgs] = Field(
+        ..., min_length=1, max_length=MAX_LINES, description="The products and quantities to order."
+    )
+
+
+class ConfirmOrderArgs(BaseModel):
+    pass
+
+
+class RequestCancellationArgs(BaseModel):
+    order_id: int = Field(..., ge=1, description="The order number to cancel.")
+
+
+class ConfirmCancellationArgs(BaseModel):
+    pass
 
 
 class ListTicketsArgs(BaseModel):
@@ -138,15 +183,30 @@ def _error(message: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _available(row: dict) -> bool:
+    return row.get("available", row["stock_quantity"] != 0)
+
+
+def _variant_out(v: dict) -> dict:
+    out = {
+        "sku": v["sku"],
+        "options": v["options"],
+        "price": str(v["price"]),
+        "availability": "out of stock" if v["stock_quantity"] == 0 else "in stock",
+    }
+    if v["stock_quantity"] is not None:
+        out["units_left"] = v["stock_quantity"]
+    return out
+
+
 def _search_products(ctx: ToolContext, args: SearchProductsArgs) -> dict:
     max_price = Decimal(str(args.max_price)) if args.max_price is not None else None
-    rows, total = ctx.db.search_products(
-        terms=search_terms(args.query),
-        category=(args.category or "").strip().lower() or None,
-        max_price=max_price,
-        in_stock_only=args.in_stock_only,
-        limit=args.limit,
-    )
+    search = {
+        "terms": search_terms(args.query),
+        "category": (args.category or "").strip().lower() or None,
+        "max_price": max_price,
+    }
+    rows, total = ctx.db.search_products(**search, in_stock_only=args.in_stock_only, limit=args.limit)
     products = []
     for p in rows:
         item = {
@@ -156,14 +216,26 @@ def _search_products(ctx: ToolContext, args: SearchProductsArgs) -> dict:
             "description": _short(p["description"]),
             "price": str(p["price"]),
             "billing_period": p["billing_period"],
-            "availability": "out of stock" if p["stock_quantity"] == 0 else "in stock",
+            "availability": "in stock" if _available(p) else "out of stock",
         }
         if p["attributes"]:
             item["details"] = {k: _short(str(v)) for k, v in p["attributes"].items()}
-        if p["stock_quantity"] is not None:
+        if p.get("variants"):
+            # Order a variant by its own SKU (prepare_order).
+            item["variants"] = [_variant_out(v) for v in p["variants"]]
+        elif p["stock_quantity"] is not None:
             item["units_left"] = p["stock_quantity"]
         products.append(item)
-    return {"total_matches": total, "shown": len(products), "products": products}
+    result = {"total_matches": total, "shown": len(products), "products": products}
+
+    # Models often set in_stock_only for "is X available?". Then X, if sold
+    # out, would look like it doesn't exist -- so name what was filtered out.
+    if args.in_stock_only:
+        everything, _ = ctx.db.search_products(**search, in_stock_only=False, limit=args.limit)
+        sold_out = [p["name"] for p in everything if not _available(p)]
+        if sold_out:
+            result["sold_out_matches"] = sold_out
+    return result
 
 
 def _list_product_types(ctx: ToolContext, args: ListProductTypesArgs) -> dict:
@@ -199,6 +271,44 @@ def _list_my_orders(ctx: ToolContext, args: ListOrdersArgs) -> dict:
     return {"count": len(orders), "orders": [_order_out(o) for o in orders]}
 
 
+def _prepare_order(ctx: ToolContext, args: PrepareOrderArgs) -> dict:
+    result = ctx.db.prepare_order_draft(
+        ctx.customer["id"], [(line.sku, line.quantity) for line in args.items], _utcnow()
+    )
+    # The form (options, prices, stock caps) goes to the customer's screen,
+    # not into the model's context.
+    form = result.pop("form", None)
+    if form is not None:
+        ctx.order_form = form
+    return result
+
+
+def _confirm_order(ctx: ToolContext, args: ConfirmOrderArgs) -> dict:
+    # Checked here, not left to the model: the order is only placed when the
+    # customer's own message says yes.
+    if not is_confirmation(ctx.user_message):
+        return {
+            "placed": False,
+            "reason": "The customer's latest message is not a clear confirmation. Show the "
+            "order summary again and ask them to reply 'yes' to place it.",
+        }
+    return ctx.db.confirm_order_draft(ctx.customer["id"], ctx.started_at, _utcnow())
+
+
+def _request_cancellation(ctx: ToolContext, args: RequestCancellationArgs) -> dict:
+    return ctx.db.request_order_cancellation(ctx.customer["id"], args.order_id, _utcnow())
+
+
+def _confirm_cancellation(ctx: ToolContext, args: ConfirmCancellationArgs) -> dict:
+    if not is_confirmation(ctx.user_message, "cancel"):
+        return {
+            "cancelled": False,
+            "reason": "The customer's latest message is not a clear confirmation. Ask them to "
+            "reply 'yes' if they want the order cancelled.",
+        }
+    return ctx.db.confirm_order_cancellation(ctx.customer["id"], ctx.started_at, _utcnow())
+
+
 def _list_my_tickets(ctx: ToolContext, args: ListTicketsArgs) -> dict:
     tickets = ctx.db.get_tickets_for_customer(ctx.customer["id"], status=args.status, limit=args.limit)
     return {
@@ -219,6 +329,24 @@ def _list_my_tickets(ctx: ToolContext, args: ListTicketsArgs) -> dict:
 # --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
+
+
+def _inline_refs(schema: dict) -> dict:
+    """Replace pydantic's `$ref`/`$defs` (used for nested models such as an
+    order line) with the definitions themselves -- small models follow a
+    self-contained schema better."""
+    defs = schema.get("$defs", {})
+
+    def resolve(node):
+        if isinstance(node, list):
+            return [resolve(x) for x in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
+        return {k: resolve(v) for k, v in node.items() if k != "$defs"}
+
+    return resolve(schema)
 
 
 def _clean_schema(node):
@@ -260,7 +388,7 @@ class Tool:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": _clean_schema(self.args_model.model_json_schema()),
+                "parameters": _clean_schema(_inline_refs(self.args_model.model_json_schema())),
             },
         }
 
@@ -299,6 +427,42 @@ ALL_TOOLS: dict[str, Tool] = {
             "status. Use for 'what did I order / buy' questions.",
             ListOrdersArgs,
             _list_my_orders,
+            requires_login=True,
+        ),
+        Tool(
+            "prepare_order",
+            "Step 1 of placing an order for the signed-in customer: get a quote and show "
+            "them an order form. This does NOT place or reserve anything, so call it as soon "
+            "as the customer wants to buy something -- even if they haven't chosen a size, "
+            "option or quantity, because the form lets them pick those (with prices) and "
+            "confirm. Use quantity 1 and the closest match when unspecified.",
+            PrepareOrderArgs,
+            _prepare_order,
+            requires_login=True,
+        ),
+        Tool(
+            "confirm_order",
+            "Step 2: place the order prepared with prepare_order. Call this ONLY when the "
+            "customer's latest message clearly says yes to that summary.",
+            ConfirmOrderArgs,
+            _confirm_order,
+            requires_login=True,
+        ),
+        Tool(
+            "request_cancellation",
+            "Step 1 of cancelling one of the signed-in customer's own orders: check it can be "
+            "cancelled and get its details. This does NOT cancel it. Show the customer the "
+            "order and ask them to confirm.",
+            RequestCancellationArgs,
+            _request_cancellation,
+            requires_login=True,
+        ),
+        Tool(
+            "confirm_cancellation",
+            "Step 2: cancel the order from request_cancellation. Call this ONLY when the "
+            "customer's latest message clearly says yes to cancelling that order.",
+            ConfirmCancellationArgs,
+            _confirm_cancellation,
             requires_login=True,
         ),
         Tool(

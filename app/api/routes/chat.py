@@ -31,4 +31,5 @@ def ask(
         sources=result.sources,
         needs_authentication=result.needs_authentication,
         tools_used=result.tools_used,
+        order_form=result.order_form,
     )

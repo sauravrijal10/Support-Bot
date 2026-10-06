@@ -1,4 +1,6 @@
-from fastapi import Depends, HTTPException, Query, status
+from datetime import datetime, timezone
+
+from fastapi import Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -6,7 +8,8 @@ from app.api.deps import get_current_customer, get_session, require_admin
 from app.api.views.base import APIView, route
 from app.models import Order
 from app.models.enums import OrderStatus
-from app.schemas.order import OrderCreate, OrderOut, OrderStatusUpdate
+from app.schemas.order import OrderCreate, OrderFormConfirm, OrderOut, OrderStatusUpdate
+from app.services import order_drafts
 from app.services import orders as order_service
 
 
@@ -27,7 +30,8 @@ class OrderView(APIView):
         """Place an order for yourself. Send only product ids and quantities --
         prices, totals and status are set by the server."""
         order = order_service.create_order(
-            session, customer["id"], [(line.product_id, line.quantity) for line in payload.items]
+            session, customer["id"],
+            [(line.product_id, line.variant_sku, line.quantity) for line in payload.items],
         )
         session.commit()
         return order
@@ -92,3 +96,39 @@ class OrderView(APIView):
         order_service.transition_order(session, order, payload.status, is_admin=True)
         session.commit()
         return order
+
+    @route(
+        "POST", "/drafts/{draft_id}/confirm",
+        response_model=OrderOut, status_code=status.HTTP_201_CREATED,
+    )
+    def confirm_order_form(
+        self,
+        draft_id: int,
+        payload: OrderFormConfirm,
+        session: Session = Depends(get_session),
+        customer: dict = Depends(get_current_customer),
+    ):
+        """Place the order from a chat order form (`order_form` in a /chat
+        answer), with the options and quantities the customer chose. Send the
+        total the form displayed as `expected_total`: if prices changed since,
+        nothing is ordered (409)."""
+        order = order_drafts.confirm_form(
+            session, customer["id"], draft_id,
+            [(line.sku, line.quantity) for line in payload.items],
+            payload.expected_total, datetime.now(timezone.utc),
+        )
+        session.commit()
+        return order
+
+    @route("POST", "/drafts/{draft_id}/discard", status_code=status.HTTP_204_NO_CONTENT)
+    def discard_order_form(
+        self,
+        draft_id: int,
+        session: Session = Depends(get_session),
+        customer: dict = Depends(get_current_customer),
+    ):
+        """The customer cancelled a chat order form; nothing was ordered."""
+        order_drafts.discard_form(session, customer["id"], draft_id, datetime.now(timezone.utc))
+        session.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+

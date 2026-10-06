@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import sqlalchemy as sa
+
 from fastapi import Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -9,7 +11,8 @@ from app.api.deps import get_optional_customer, get_session, require_admin
 from app.api.views.base import APIView, route
 from app.models import Product, ProductType
 from app.schemas.product import ProductCreate, ProductOut, ProductUpdate
-from app.services.catalog import validate_attributes
+from app.services.catalog import validate_product
+from app.services.variants import in_stock_clause, lock_skus, sku_taken
 
 UNIQUE_VIOLATION = "23505"
 FOREIGN_KEY_VIOLATION = "23503"
@@ -34,6 +37,29 @@ def _type_for_validation(session: Session, type_id: int, *, new_assignment: bool
             status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown or inactive product type: {type_id}"
         )
     return product_type
+
+
+def _validated(
+    session: Session, product_type: ProductType, sku: str, attributes: dict, variants: list[dict],
+    stock_quantity: int | None, exclude_product_id: int | None = None,
+) -> tuple[dict, list[dict]]:
+    """Check attributes + variants against the type, and that no SKU (the
+    product's or a variant's) is used by another product or its variants.
+    Returns (attributes, variants) as stored."""
+    attributes, variants = validate_product(
+        product_type.attribute_schema, attributes, variants, sku, product_type.name
+    )
+    if variants and stock_quantity is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A product with variants keeps stock per variant: set stock_quantity to null.",
+        )
+    skus = [sku, *(v["sku"] for v in variants)]
+    lock_skus(session, skus)  # held to commit, so two writers can't claim the same SKU
+    taken = [s for s in skus if sku_taken(session, s, exclude_product_id)]
+    if taken:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"SKU(s) already used by another product: {taken}")
+    return attributes, variants
 
 
 class ProductView(APIView):
@@ -71,6 +97,7 @@ class ProductView(APIView):
                     Product.name.icontains(q, autoescape=True),
                     Product.description.icontains(q, autoescape=True),
                     Product.sku.icontains(q, autoescape=True),
+                    sa.cast(Product.variants, sa.Text).icontains(q, autoescape=True),
                 )
             )
         if product_type:
@@ -80,9 +107,7 @@ class ProductView(APIView):
         if max_price is not None:
             stmt = stmt.where(Product.price <= max_price)
         if in_stock:
-            stmt = stmt.where(
-                or_(Product.stock_quantity.is_(None), Product.stock_quantity > 0)
-            )
+            stmt = stmt.where(in_stock_clause())
         stmt = stmt.order_by(Product.name, Product.id).limit(limit).offset(offset)
         return session.scalars(stmt).all()
 
@@ -108,8 +133,9 @@ class ProductView(APIView):
     ):
         product_type = _type_for_validation(session, payload.product_type_id, new_assignment=True)
         data = payload.model_dump()
-        data["attributes"] = validate_attributes(
-            product_type.attribute_schema, payload.attributes, product_type.name
+        data["attributes"], data["variants"] = _validated(
+            session, product_type, payload.sku, payload.attributes,
+            [v.model_dump() for v in payload.variants], payload.stock_quantity,
         )
         product = Product(**data, product_type=product_type)
         session.add(product)
@@ -135,15 +161,18 @@ class ProductView(APIView):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
 
         changes = payload.model_dump(exclude_unset=True)
-        if "product_type_id" in changes or "attributes" in changes:
+        if changes.keys() & {"product_type_id", "attributes", "variants", "sku", "stock_quantity"}:
             type_id = changes.get("product_type_id", product.product_type_id)
             product_type = _type_for_validation(
                 session, type_id, new_assignment=type_id != product.product_type_id
             )
-            changes["attributes"] = validate_attributes(
-                product_type.attribute_schema,
+            changes["attributes"], changes["variants"] = _validated(
+                session, product_type,
+                changes.get("sku", product.sku),
                 changes.get("attributes", product.attributes),
-                product_type.name,
+                changes.get("variants", product.variants),
+                changes.get("stock_quantity", product.stock_quantity),
+                exclude_product_id=product.id,
             )
             product.product_type = product_type
 

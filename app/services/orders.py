@@ -15,7 +15,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Order, OrderItem, Product
+from app.services import variants
 from app.services.errors import ConflictError, InvalidRequestError, NotFoundError
+from app.services.variants import find_variant
 
 MAX_QUANTITY_PER_LINE = 100
 
@@ -44,43 +46,61 @@ def _lock_products(session: Session, product_ids: list[int]) -> dict[int, Produc
     return {p.id: p for p in rows}
 
 
-def create_order(session: Session, customer_id: int, lines: list[tuple[int, int]]) -> Order:
-    """lines: (product_id, quantity) pairs. Prices always come from the
+def _line_order(item):
+    (product_id, variant_sku), _ = item
+    return product_id, variant_sku or ""
+
+
+def create_order(
+    session: Session, customer_id: int, lines: list[tuple[int, str | None, int]]
+) -> Order:
+    """lines: (product_id, variant_sku or None, quantity). A product with
+    variants must be ordered as one of them. Prices always come from the
     database -- the client never supplies them."""
-    wanted: dict[int, int] = {}
-    for product_id, quantity in lines:
-        wanted[product_id] = wanted.get(product_id, 0) + quantity
+    wanted: dict[tuple[int, str | None], int] = {}
+    for product_id, variant_sku, quantity in lines:
+        key = (product_id, variant_sku.upper() if variant_sku else None)
+        wanted[key] = wanted.get(key, 0) + quantity
 
     if any(q > MAX_QUANTITY_PER_LINE for q in wanted.values()):
         raise InvalidRequestError(
             f"At most {MAX_QUANTITY_PER_LINE} of any one product per order"
         )
 
-    product_ids = sorted(wanted)
-    products = _lock_products(session, product_ids)
-
-    # Same message for "doesn't exist" and "inactive": don't reveal hidden products.
-    unavailable = [pid for pid in product_ids if pid not in products or not products[pid].is_active]
-    if unavailable:
-        raise InvalidRequestError(f"Product(s) not available: {unavailable}")
+    products = _lock_products(session, sorted({pid for pid, _ in wanted}))
 
     items = []
     total = Decimal("0.00")
-    for pid in product_ids:
-        product, quantity = products[pid], wanted[pid]
-        if product.stock_quantity is not None:
-            if product.stock_quantity < quantity:
-                raise ConflictError(f"Not enough stock for '{product.name}'")
-            product.stock_quantity -= quantity
+    for (pid, variant_sku), quantity in sorted(wanted.items(), key=_line_order):
+        product = products.get(pid)
+        variant = find_variant(product, variant_sku) if product is not None else None
+        if product is not None and product.is_active and product.variants and variant_sku is None:
+            choices = [v["sku"] for v in product.variants if v.get("is_active", True)]
+            raise InvalidRequestError(f"Choose a variant of '{product.name}': {choices}")
+        # Same message for "doesn't exist" and "inactive": don't reveal hidden
+        # products. A variant SKU this product doesn't have is refused too,
+        # never quietly ignored.
+        unknown_variant = variant_sku is not None and variant is None
+        if product is None or unknown_variant or not variants.is_sellable(product, variant):
+            raise InvalidRequestError(
+                f"Product(s) not available: {[pid] if variant_sku is None else [variant_sku]}"
+            )
+
+        stock = variants.stock_of(product, variant)
+        if stock is not None and stock < quantity:
+            raise ConflictError(f"Not enough stock for '{variants.display_name(product, variant)}'")
+        variants.change_stock(product, variant, -quantity)
+        price = variants.unit_price(product, variant)
         items.append(
             OrderItem(
                 product_id=pid,
-                product_name=product.name,
-                unit_price=product.price,
+                variant_sku=variant["sku"] if variant else None,
+                product_name=variants.display_name(product, variant)[:200],
+                unit_price=price,
                 quantity=quantity,
             )
         )
-        total += product.price * quantity
+        total += price * quantity
 
     order = Order(customer_id=customer_id, status="pending", total_amount=total, items=items)
     session.add(order)
@@ -92,8 +112,12 @@ def _restore_stock(session: Session, order: Order) -> None:
     products = _lock_products(session, sorted({i.product_id for i in order.items}))
     for item in order.items:
         product = products.get(item.product_id)
-        if product is not None and product.stock_quantity is not None:
-            product.stock_quantity += item.quantity
+        if product is None:
+            continue
+        variant = find_variant(product, item.variant_sku)
+        if item.variant_sku and variant is None:
+            continue  # the variant was removed since; nothing to put back
+        variants.change_stock(product, variant, item.quantity)
 
 
 def transition_order(session: Session, order: Order, new_status: str, *, is_admin: bool) -> None:

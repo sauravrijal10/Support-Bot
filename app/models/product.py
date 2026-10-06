@@ -48,6 +48,11 @@ class Product(Base):
             sql_in("billing_period", BILLING_PERIODS), name="ck_products_billing_period"
         ),
         sa.Index("ix_products_product_type_id", "product_type_id"),
+        # Finds the product owning a variant SKU: variants @> '[{"sku": "..."}]'
+        sa.Index(
+            "ix_products_variants", "variants",
+            postgresql_using="gin", postgresql_ops={"variants": "jsonb_path_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -59,8 +64,13 @@ class Product(Base):
     attributes: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"))
     price: Mapped[Decimal] = mapped_column(sa.Numeric(10, 2))
     billing_period: Mapped[str] = mapped_column(sa.String(16), server_default="one_time")
-    # NULL = unlimited (digital goods). A number = units left.
+    # NULL = unlimited (digital goods). A number = units left. Unused (NULL)
+    # when the product has variants -- each variant has its own stock.
     stock_quantity: Mapped[int | None]
+    # Sellable versions of the product, e.g. sizes/colours (see
+    # app/services/variants.py): [{"sku", "options": {...}, "price",
+    # "stock_quantity", "is_active"}]. Empty = the product itself is sold.
+    variants: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"))
     is_active: Mapped[bool] = mapped_column(server_default=sa.true())
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now()

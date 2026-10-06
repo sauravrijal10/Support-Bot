@@ -18,7 +18,7 @@ support-bot/
 │   ├── main.py                  # FastAPI app + startup (migrations, KB index, clients)
 │   ├── config.py                # reads HF_TOKEN / DATABASE_URL / JWT_SECRET from the environment
 │   ├── db/                      # SQLAlchemy Base, pooled engine/session, migration runner
-│   ├── models/                  # ORM models: Customer, Product, Order, OrderItem, Ticket
+│   ├── models/                  # ORM models: Customer, ProductType, Product, Order, OrderItem, Ticket
 │   ├── api/
 │   │   ├── deps.py              # bearer token -> customer; require_admin; DB session
 │   │   ├── routes/              # function-based routes
@@ -29,6 +29,7 @@ support-bot/
 │   │   │   └── health.py        # GET /health
 │   │   └── views/               # CLASS-BASED views (one class per resource)
 │   │       ├── base.py          # APIView + @route helper
+│   │       ├── product_types.py # ProductTypeView (categories + their attribute definitions)
 │   │       ├── products.py      # ProductView
 │   │       ├── orders.py        # OrderView
 │   │       └── tickets.py       # TicketView
@@ -44,6 +45,7 @@ support-bot/
 │       ├── database.py              # ORM-backed helpers for chat/login (customer data scoped by customer_id)
 │       ├── llm.py                   # HF chat-completion client: model/provider, retry, 503 on failure
 │       ├── tools.py                 # TOOL CALLING: schemas + handlers the model may invoke
+│       ├── catalog.py               # product attributes checked against their type's definition
 │       ├── customer_lookup.py       # signed-out gate only (spots account-type questions)
 │       └── chat_service.py          # retrieve FAQ -> tool-calling loop -> answer
 ├── knowledge/
@@ -75,6 +77,13 @@ install needed.
      free (checked against the live listing at
      https://router.huggingface.co/v1/models). A `402 Payment Required`
      from the API means the account is out of credit.
+   - `HF_FALLBACK_TOKENS` (optional) -- more tokens, comma-separated, e.g.
+     from a second HF account. If a token is expired/invalid (401), out of
+     credit (402), not permitted (403) or rate-limited (429), the same
+     request is retried with the next token, and the failed one is skipped
+     for an hour (a minute for rate limits) before being tried again. The
+     server log names which token failed (by its last 4 characters only).
+     Provider outages (5xx) don't switch tokens -- they'd fail on any.
    - `JWT_SECRET` -- signs login tokens; at least 32 characters. Generate one:
      `python -c "import secrets; print(secrets.token_urlsafe(48))"`
    - `LLM_MODEL` / `LLM_PROVIDER` (optional) -- default to
@@ -99,7 +108,9 @@ install needed.
    docker compose run --rm app python seed_data.py
    ```
    It creates an **admin** (`admin@example.com`), two customers (Ada and
-   Grace), a small product catalog, and a few orders and tickets. It prints a
+   Grace), a catalog of **6 product types** (digital services, electronics,
+   clothing, books, home & kitchen, gift cards) with **30 products**, and a
+   few orders and tickets. Re-running it only adds what is missing. It prints a
    random password for each new account **once** -- copy them. There are no
    default credentials. (To get fresh ones, run `docker compose down -v` and
    seed again.)
@@ -142,6 +153,18 @@ install needed.
    - "Do you support Windows Phone?" (should say it doesn't know — good, that's the point)
    - Anyone: "Do you sell a backup drive and how many are in stock?" (calls
      `search_products` -- check `tools_used` in the response)
+   - Anyone: "What kinds of products do you sell?" (calls `list_product_types`)
+   - Anyone: "Do you have any books by Maya Rivera?" / "Show me clothing under
+     $30 that is in stock" (search by attribute values and category)
+   - Anyone: "Is the USB-C hub available?" (it's seeded as sold out -- the bot
+     says so rather than claiming it doesn't exist)
+   - Signed in: "I'd like 2 black logo T-shirts in M and the Backup Handbook" --
+     the bot quotes the items and total (`prepare_order`) and asks you to
+     confirm; reply "yes" and it places the order (`confirm_order`) and gives
+     you the order number.
+   - Signed in: "Please cancel order 5" -- the bot shows the order and asks you
+     to confirm (`request_cancellation`); reply "yes, cancel it" and it's
+     cancelled (`confirm_cancellation`). Only `pending` orders can be.
    - As **admin**, `PATCH /products/{id}` with `{"price": "7.50"}` (or set
      `stock_quantity` to `0`), then ask the bot again -- its answer changes
      immediately, because the tool reads the table on every call.
@@ -253,6 +276,59 @@ websocat ws://localhost:8020/ws/chat
 {"type": "message", "question": "How many are in stock?"}
 ```
 
+### Ordering and cancelling through the chat
+
+The bot can place orders, in two steps, with the safety checks done by the
+server (`app/services/order_drafts.py`), not just asked of the model:
+
+1. `prepare_order` saves a **draft** (a quote: items, current prices, total)
+   in the `order_drafts` table. Nothing is ordered or reserved.
+2. `confirm_order` places the customer's open draft through the same
+   `create_order` as `POST /orders`, and is refused unless:
+   - the draft was prepared in an **earlier** message (the customer has seen
+     the summary -- quote and confirm can't happen in one turn);
+   - the customer's **current message is a clear yes** ("yes", "ok, place
+     it" ...; anything with "no", "wait", "change" etc. is not);
+   - the draft is less than **15 minutes** old;
+   - the total is **unchanged** (a price change means a new quote).
+
+**The order form (web chat).** When the bot prepares an order, the chat
+answer also carries an `order_form` (in `POST /chat` and the WebSocket
+`answer` frame): each line with its **options** -- the product's active
+variants (or just the product, if it has none) -- with their prices and how
+many can be ordered. If the bot names the product rather than a variant, an
+in-stock variant is preselected. The chat page shows it as a card:
+pick a variant, enter a quantity (capped at its stock), see the line and order
+totals update, then **Confirm order** or **Cancel**:
+```
+POST /orders/drafts/{draft_id}/confirm
+{ "items": [{"sku": "TSHIRT-LOGO-BLK-L", "quantity": 2}], "expected_total": "48.00" }
+POST /orders/drafts/{draft_id}/discard
+```
+A click by the signed-in customer is itself the confirmation (so no "earlier
+message" rule here). `expected_total` is the total the form displayed: if
+current prices give a different total, nothing is ordered (`409`) -- the
+customer never pays a total they didn't see. A form can be used once, only
+by its customer, for 15 minutes, and a newer quote retires older forms.
+Replying "yes" in the chat still works too (for text-only clients).
+
+A new quote replaces the customer's previous open draft, a draft can only be
+placed once (row lock), and stock is re-checked when placing. Orders placed
+this way are normal `pending` orders, so the customer can still cancel them.
+Ordering needs a signed-in customer; the confirmation wording check is
+English-only.
+
+**Cancelling** works the same way (`app/services/order_cancellations.py`):
+`request_cancellation(order_id)` checks the order is the customer's own and
+still `pending`, records the request (table `cancellation_requests`) and shows
+the order; `confirm_cancellation` cancels it -- returning the items to stock --
+only if the request came in an earlier message, the current message is a
+clear yes ("yes, cancel it"; "no, keep it" is not), it's under 15 minutes
+old, and the order is still pending. Processing or completed orders get an
+explanation instead (contact support / returns policy). The bot only ever
+touches the signed-in customer's **own** orders -- even an admin chatting
+with it can't cancel other customers' orders through the bot.
+
 ### Products, orders and tickets
 
 These are **class-based views** (`app/api/views/`) over Postgres tables. Who can
@@ -260,6 +336,8 @@ do what:
 
 | Endpoint | Signed out | Customer | Admin |
 |---|---|---|---|
+| `GET /product-types`, `GET /product-types/{id}` | active types | active types | + inactive (`?include_inactive=true`) |
+| `POST /product-types`, `PATCH /product-types/{id}`, `DELETE /product-types/{id}` | 401 | 403 | yes |
 | `GET /products`, `GET /products/{id}` | active products | active products | + inactive (`?include_inactive=true`) |
 | `POST /products`, `PATCH /products/{id}`, `DELETE /products/{id}` | 401 | 403 | yes |
 | `POST /orders` | 401 | place an order for **yourself** | yes (as themselves) |
@@ -272,10 +350,81 @@ do what:
 
 Other people's orders and tickets return `404` -- identical to a nonexistent id.
 
-**Products** -- `{sku, name, description, price, billing_period, stock_quantity, is_active}`.
+**Product types** -- every product belongs to one type (books, clothing, ...),
+and the type defines which **attributes** its products carry:
+```json
+POST /product-types
+{
+  "slug": "clothing", "name": "Clothing", "description": "Acme apparel.",
+  "attribute_schema": [
+    {"key": "size",  "label": "Size",   "type": "choice", "required": true, "options": ["S", "M", "L"]},
+    {"key": "color", "label": "Colour", "type": "text",   "required": true},
+    {"key": "weight_g", "label": "Weight", "type": "integer", "unit": "g"}
+  ]
+}
+```
+Attribute `type` is `text`, `integer`, `number`, `boolean` or `choice` (which
+needs `options`). `slug` is lower-case words joined by hyphens. Rules:
+- Changing a type's `attribute_schema` is refused (`409`) if any existing
+  product of that type wouldn't match the new one -- fix those products first.
+- A type that still has products can't be deleted (`409`); deactivate it
+  instead (`PATCH {"is_active": false}`). An inactive type is hidden from the
+  listing and can't receive new products; its existing products stay as they
+  are (each product's own `is_active` controls whether it's for sale).
+- Products that existed before types were introduced were put in a `general`
+  type with no attributes (the seed script moves its own demo products out).
+
+**Products** -- `{sku, product_type_id, name, description, attributes, price,
+billing_period, stock_quantity, is_active}`. `attributes` must match the
+product type: required attributes present, no unknown keys, values of the
+declared kind (otherwise `422`, listing every problem). Changing a product's
+type usually means sending new `attributes` in the same `PATCH`. Responses
+include `product_type: {id, slug, name}` and a computed `in_stock`.
 `billing_period` is `one_time`, `monthly` or `yearly`. `stock_quantity: null`
 means unlimited (digital goods); a number is units left. List supports
-`?q=` search (name/description/SKU), `?limit=` (1-100) and `?offset=`.
+`?q=` search (name/description/SKU), `?type=<slug>`, `?min_price=`,
+`?max_price=`, `?in_stock=true`, `?limit=` (1-100) and `?offset=`.
+
+**Variants** -- sizes, colours, formats... are stored as a JSON list in the
+product's `variants` column (Postgres JSONB):
+```json
+POST /products
+{
+  "sku": "TSHIRT-LOGO", "product_type_id": 4, "name": "Acme logo T-shirt", "price": "24.00",
+  "attributes": {"material": "Organic cotton", "fit": "Unisex"},
+  "variants": [
+    {"sku": "TSHIRT-LOGO-BLK-M", "options": {"size": "M", "color": "Black"}, "stock_quantity": 30},
+    {"sku": "TSHIRT-LOGO-NVY-L", "options": {"size": "L", "color": "Navy"}, "price": "26.00", "stock_quantity": 6}
+  ]
+}
+```
+- Which attributes vary is set on the **product type**: attribute definitions
+  with `"variant": true` (e.g. clothing `size`/`color`, books `format`,
+  electronics `capacity`/`model`/`color`, gift cards `amount`/`delivery`). A
+  product with variants sets those in each variant's `options` and only the
+  other attributes on itself; a product without variants sets all of them on
+  itself, as before.
+- Each variant has its **own SKU, stock and (optionally) price** (`null` =
+  the product's price). The product's own `stock_quantity` must be `null`
+  once it has variants. Responses add `in_stock` per variant, and the
+  product's `in_stock` is true if any active variant is.
+- SKUs are unique across all products **and** variants (`409` otherwise).
+  Postgres can't enforce uniqueness inside a JSON array, so the app checks it
+  under per-SKU advisory locks; a GIN index on `variants` keeps the lookup fast.
+- `PATCH` with `variants` replaces the whole list. To stop selling a variant,
+  set its `is_active: false` (removing it is allowed -- order lines keep a
+  snapshot -- but cancelling such an order can't put its stock back).
+- **Ordering**: `POST /orders` items take `variant_sku` -- required for a
+  product with variants (`422` lists the choices). Order lines record
+  `variant_sku` and a name like `Acme logo T-shirt (Size: M, Colour: Black)`.
+  Stock is taken from, and on cancel returned to, that variant.
+- `?in_stock=true` and the bot's search look inside the variants; `?q=` and
+  the bot's search also match variant SKUs and options.
+
+The seed script converted the earlier one-product-per-size items (e.g. the
+separate `TSHIRT-LOGO-BLK-M` / `-L` products) into variants of one product,
+carrying their stock over; the old products stay, inactive and renamed
+`...-OLD<id>`, because past orders point at them.
 Deleting a product that appears on an order returns `409` -- deactivate it
 instead (`PATCH {"is_active": false}`).
 
@@ -320,7 +469,12 @@ question, whether to call one:
 
 | Tool | What it does | Needs login |
 |---|---|---|
-| `search_products` | Search the live catalog by keywords / max price / in-stock | No |
+| `search_products` | Search the live catalog by keywords (name, description, attribute values) / category / max price / in-stock | No |
+| `list_product_types` | The store's categories, with product counts and the details each lists | No |
+| `prepare_order` | Quote an order (SKUs + quantities): checks stock and prices, saves a draft, orders **nothing** | Yes |
+| `confirm_order` | Place the customer's quoted order | Yes |
+| `request_cancellation` | Check one of the customer's own orders can be cancelled and show it; cancels **nothing** | Yes |
+| `confirm_cancellation` | Cancel that order (stock goes back) | Yes |
 | `get_order` | Look up ONE of the signed-in customer's own orders by number | Yes |
 | `list_my_orders` | The signed-in customer's own orders, optionally by status | Yes |
 | `list_my_tickets` | The signed-in customer's own tickets, optionally by status | Yes |
@@ -328,7 +482,7 @@ question, whether to call one:
 | Caller | Question | Result |
 |---|---|---|
 | Signed out | general / FAQ | Answered from the FAQ |
-| Signed out | product / pricing | May call `search_products`; that's the only tool it's offered |
+| Signed out | product / pricing | May call `search_products` or `list_product_types`; those are the only tools it's offered |
 | Signed out | mentions "my order", an order number, or an email | `needs_authentication: true`, a "please log in" message, no model call |
 | Signed in | anything | FAQ chunks + whichever tools the model chooses to call, scoped to **that customer's own** data |
 | Any | model provider busy or failing | `503` with a friendly message and `Retry-After` (one automatic retry on transient errors) |

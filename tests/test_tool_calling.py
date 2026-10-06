@@ -66,6 +66,10 @@ class FakeDB:
     def __init__(self):
         self.order_lookups = []
         self.product_searches = []
+        self.drafts = []
+        self.confirms = []
+        self.cancel_requests = []
+        self.cancel_confirms = []
         self.fail = False
 
     def get_order_for_customer(self, order_id, customer_id):
@@ -94,6 +98,22 @@ class FakeDB:
         return [{"sku": "PLUS-PLAN", "name": "Plus plan", "type": "Digital services", "description": "100GB",
                  "attributes": {"Storage": "100 GB"}, "price": Decimal("5.00"),
                  "billing_period": "monthly", "stock_quantity": None}], 1
+
+    def prepare_order_draft(self, customer_id, lines, now):
+        self.drafts.append((customer_id, lines))
+        return {"draft_ready": True, "total": "48.00", "form": {"draft_id": 7, "lines": [], "total": "48.00"}}
+
+    def confirm_order_draft(self, customer_id, request_started_at, now):
+        self.confirms.append((customer_id, request_started_at))
+        return {"placed": True, "order": {"order_id": 9}}
+
+    def request_order_cancellation(self, customer_id, order_id, now):
+        self.cancel_requests.append((customer_id, order_id))
+        return {"cancellable": True, "order": {"order_id": order_id}}
+
+    def confirm_order_cancellation(self, customer_id, request_started_at, now):
+        self.cancel_confirms.append(customer_id)
+        return {"cancelled": True}
 
     def list_product_types(self):
         return [{"slug": "books", "name": "Books", "description": "Printed books and e-books.",
@@ -259,6 +279,23 @@ def test_product_search_passes_a_normalised_category_and_shows_type_and_details(
     assert result["details"] == {"Storage": "100 GB"}
 
 
+def test_in_stock_search_still_names_sold_out_matches():
+    class StockDB(FakeDB):
+        def search_products(self, terms, category=None, max_price=None, in_stock_only=False, limit=10):
+            self.product_searches.append({"in_stock_only": in_stock_only})
+            hub = {"sku": "HUB", "name": "USB-C hub", "type": "Electronics", "description": "",
+                   "attributes": {}, "price": Decimal("49.00"), "billing_period": "one_time",
+                   "stock_quantity": 0}
+            return ([], 0) if in_stock_only else ([hub], 1)
+
+    llm = FakeLLM(reply(calls=[tool_call("search_products", '{"query": "usb hub", "in_stock_only": true}')]),
+                  reply("Sold out."))
+    _, db = ask(llm, "Is the USB-C hub available?", customer=None, db=StockDB())
+    result = json.loads(llm.requests[1][0][-1]["content"])
+    assert result["products"] == [] and result["sold_out_matches"] == ["USB-C hub"]
+    assert db.product_searches == [{"in_stock_only": True}, {"in_stock_only": False}]
+
+
 def test_list_product_types_is_public_and_shows_categories():
     llm = FakeLLM(reply(calls=[tool_call("list_product_types", "{}")]), reply("We sell books."))
     result, _ = ask(llm, "what do you sell?", customer=None)
@@ -294,6 +331,7 @@ def test_schemas_are_flat_and_simple_for_small_models():
     for tool in ALL_TOOLS.values():
         text = json.dumps(tool.schema())
         assert '"title"' not in text and "anyOf" not in text and '"null"' not in text, tool.name
+        assert "$ref" not in text and "$defs" not in text, tool.name
     assert ALL_TOOLS["get_order"].schema()["function"]["parameters"]["required"] == ["order_id"]
     assert "required" not in ALL_TOOLS["search_products"].schema()["function"]["parameters"]
 
@@ -326,11 +364,9 @@ class FlakyClient:
         return outcome
 
 
-def llm_with(client, monkeypatch):
+def llm_with(client, monkeypatch, *more_clients):
     monkeypatch.setattr("app.services.llm.time.sleep", lambda s: None)
-    wrapper = LLMClient.__new__(LLMClient)
-    wrapper.model, wrapper._client = "m", client
-    return wrapper
+    return LLMClient.with_clients("m", [client, *more_clients])
 
 
 def test_rate_limit_is_not_retried_and_becomes_503(monkeypatch):
@@ -365,6 +401,68 @@ def test_network_errors_are_retried(monkeypatch):
     assert llm_with(client, monkeypatch).complete([]) == "answer"
 
 
+@pytest.mark.parametrize("code", [401, 402, 403, 429])
+def test_an_account_level_failure_moves_on_to_the_next_token(monkeypatch, code):
+    first, second = FlakyClient(http_error(code)), FlakyClient("answer")
+    assert llm_with(first, monkeypatch, second).complete([]) == "answer"
+    assert first.calls == 1 and second.calls == 1
+
+
+def test_a_failed_token_is_skipped_on_later_requests(monkeypatch):
+    first, second = FlakyClient(http_error(402)), FlakyClient("one", "two")
+    llm = llm_with(first, monkeypatch, second)
+    assert llm.complete([]) == "one" and llm.complete([]) == "two"
+    assert first.calls == 1  # not tried again while cooling down
+
+
+def test_a_token_is_tried_again_once_its_cooldown_is_over(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("app.services.llm.time.monotonic", lambda: clock[0])
+    first, second = FlakyClient(http_error(402), "back"), FlakyClient("fallback")
+    llm = llm_with(first, monkeypatch, second)
+    assert llm.complete([]) == "fallback"
+    clock[0] += 3601
+    assert llm.complete([]) == "back"  # the first token is preferred again
+
+
+def test_when_every_token_is_benched_they_are_still_tried(monkeypatch):
+    first, second = FlakyClient(http_error(402), "refilled"), FlakyClient(http_error(402))
+    llm = llm_with(first, monkeypatch, second)
+    with pytest.raises(ServiceUnavailableError):
+        llm.complete([])
+    assert llm.complete([]) == "refilled"
+
+
+def test_all_tokens_rate_limited_says_busy_otherwise_unavailable(monkeypatch):
+    with pytest.raises(ServiceUnavailableError, match="too many requests"):
+        llm_with(FlakyClient(http_error(429)), monkeypatch, FlakyClient(http_error(429))).complete([])
+    with pytest.raises(ServiceUnavailableError, match="temporarily unavailable"):
+        llm_with(FlakyClient(http_error(402)), monkeypatch, FlakyClient(http_error(429))).complete([])
+
+
+@pytest.mark.parametrize("error", [http_error(500), http_error(405)])
+def test_provider_side_failures_do_not_switch_tokens(monkeypatch, error):
+    # A provider outage or a bad request fails the same way with any token.
+    first, second = FlakyClient(error, error), FlakyClient("unused")
+    with pytest.raises(ServiceUnavailableError):
+        llm_with(first, monkeypatch, second).complete([])
+    assert second.calls == 0
+
+
+def test_tokens_from_settings_are_ordered_and_deduplicated(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("HF_TOKEN", "hf_main")
+    monkeypatch.setenv("HF_FALLBACK_TOKENS", " hf_second, ,hf_main,hf_third ")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("JWT_SECRET", "s" * 40)
+    get_settings.cache_clear()
+    try:
+        assert get_settings().hf_tokens == ("hf_main", "hf_second", "hf_third")
+    finally:
+        get_settings.cache_clear()
+
+
 def test_tools_are_only_sent_when_provided(monkeypatch):
     seen = []
     client = NS(chat=NS(completions=NS(create=lambda **kw: seen.append(kw) or "r")))
@@ -372,3 +470,92 @@ def test_tools_are_only_sent_when_provided(monkeypatch):
     llm.complete([], tools=None)
     llm.complete([], tools=[{"type": "function"}])
     assert "tools" not in seen[0] and seen[1]["tool_choice"] == "auto" and seen[1]["temperature"] == 0.2
+
+
+# ---------------------------------------------------------------- ordering
+
+
+WRITE_TOOLS = {"prepare_order", "confirm_order", "request_cancellation", "confirm_cancellation"}
+
+
+def test_ordering_and_cancelling_tools_are_never_offered_to_signed_out_callers():
+    assert not WRITE_TOOLS & set(tools_for(None))
+    assert WRITE_TOOLS <= set(tools_for(ADA))
+
+
+def test_prepare_order_schema_is_inlined_and_needs_items():
+    params = ALL_TOOLS["prepare_order"].schema()["function"]["parameters"]
+    assert params["required"] == ["items"]
+    line = params["properties"]["items"]["items"]
+    assert line["type"] == "object" and set(line["properties"]) == {"sku", "quantity"}
+
+
+def test_prepare_order_quotes_for_the_authenticated_customer_only():
+    args = '{"items": [{"sku": "TSHIRT-LOGO-BLK-M", "quantity": 2}], "customer_id": 2}'
+    llm = FakeLLM(reply(calls=[tool_call("prepare_order", args)]), reply("That's $48. Confirm?"))
+    result, db = ask(llm, "I'd like two black T-shirts in M")
+    assert db.drafts == [(ADA["id"], [("TSHIRT-LOGO-BLK-M", 2)])]
+    assert db.confirms == []  # quoting never places anything
+    assert result.tools_used == ["prepare_order"]
+    # The form goes to the customer's screen, not into the model's context.
+    assert result.order_form == {"draft_id": 7, "lines": [], "total": "48.00"}
+    assert "form" not in json.loads(llm.requests[1][0][-1]["content"])
+
+
+@pytest.mark.parametrize("args", ['{"items": []}', '{"items": [{"sku": "X", "quantity": 0}]}', "{}"])
+def test_prepare_order_rejects_bad_lines(args):
+    llm = FakeLLM(reply(calls=[tool_call("prepare_order", args)]), reply("hmm"))
+    _, db = ask(llm, "order something")
+    assert db.drafts == [] and "error" in json.loads(llm.requests[1][0][-1]["content"])
+
+
+def test_confirm_order_places_the_order_when_the_customer_says_yes():
+    llm = FakeLLM(reply(calls=[tool_call("confirm_order", "{}")]), reply("Done! Order 9."))
+    _, db = ask(llm, "Yes, place it please")
+    assert len(db.confirms) == 1 and db.confirms[0][0] == ADA["id"]
+    assert json.loads(llm.requests[1][0][-1]["content"])["placed"] is True
+
+
+@pytest.mark.parametrize("message", ["How much is the hoodie?", "No, wait", "yes but change the size", "hmm"])
+def test_confirm_order_is_refused_unless_the_message_is_a_clear_yes(message):
+    llm = FakeLLM(reply(calls=[tool_call("confirm_order", "{}")]), reply("Shall I place it?"))
+    _, db = ask(llm, message)
+    assert db.confirms == []  # the database was never asked to place anything
+    assert json.loads(llm.requests[1][0][-1]["content"])["placed"] is False
+
+
+def test_confirm_passes_when_this_request_started():
+    llm = FakeLLM(reply(calls=[tool_call("confirm_order", "{}")]), reply("Done."))
+    before = datetime.now().astimezone()
+    _, db = ask(llm, "yes")
+    assert before <= db.confirms[0][1] <= datetime.now().astimezone()
+
+
+# ---------------------------------------------------------------- cancelling
+
+
+def test_request_cancellation_is_scoped_to_the_authenticated_customer():
+    args = '{"order_id": 8, "customer_id": 2}'
+    llm = FakeLLM(reply(calls=[tool_call("request_cancellation", args)]), reply("Cancel order 8?"))
+    _, db = ask(llm, "Please cancel order 8")
+    assert db.cancel_requests == [(ADA["id"], 8)] and db.cancel_confirms == []
+
+
+def test_confirm_cancellation_runs_when_the_customer_says_yes_cancel_it():
+    llm = FakeLLM(reply(calls=[tool_call("confirm_cancellation", "{}")]), reply("Cancelled."))
+    _, db = ask(llm, "Yes, cancel it")
+    assert db.cancel_confirms == [ADA["id"]]
+
+
+@pytest.mark.parametrize("message", ["no, keep it", "What's in order 8?", "wait"])
+def test_confirm_cancellation_is_refused_unless_the_message_is_a_clear_yes(message):
+    llm = FakeLLM(reply(calls=[tool_call("confirm_cancellation", "{}")]), reply("Keep it?"))
+    _, db = ask(llm, message)
+    assert db.cancel_confirms == []
+    assert json.loads(llm.requests[1][0][-1]["content"])["cancelled"] is False
+
+
+def test_a_form_with_an_empty_reply_gets_a_sentence_pointing_at_it():
+    llm = FakeLLM(reply(calls=[tool_call("prepare_order", '{"items": [{"sku": "HOODIE"}]}')]), reply("[Order Form]"))
+    result, _ = ask(llm, "I'd like a hoodie")
+    assert result.answer == chat_service.ORDER_FORM_MESSAGE and result.order_form is not None

@@ -124,3 +124,60 @@ def test_product_attribute_values_keep_their_json_types():
     update = ProductUpdate(attributes={"pages": 312, "wireless": True, "rating": 4.5, "author": "Maya"})
     assert update.attributes == {"pages": 312, "wireless": True, "rating": 4.5, "author": "Maya"}
     assert type(update.attributes["wireless"]) is bool and type(update.attributes["pages"]) is int
+
+
+# ---------------------------------------------------------------- variants
+
+from app.services.catalog import validate_product, variant_errors  # noqa: E402
+
+SHIRTS = [
+    {"key": "size", "label": "Size", "type": "choice", "required": True, "variant": True, "options": ["M", "L"]},
+    {"key": "color", "label": "Colour", "type": "text", "required": True, "variant": True},
+    {"key": "material", "label": "Material", "type": "text"},
+]
+
+
+def _variant(sku, **options):
+    return {"sku": sku, "options": options, "price": None, "stock_quantity": 3, "is_active": True}
+
+
+def test_variants_are_validated_and_normalised():
+    attrs, variants = validate_product(
+        SHIRTS, {"material": "Cotton"},
+        [_variant("shirt-blk-m", size="M", color=" Black "), {**_variant("SHIRT-BLK-L", size="L", color="Black"), "price": 26}],
+        "SHIRT",
+    )
+    assert attrs == {"material": "Cotton"}
+    assert variants[0] == {"sku": "SHIRT-BLK-M", "options": {"size": "M", "color": "Black"},
+                           "price": None, "stock_quantity": 3, "is_active": True}
+    assert variants[1]["price"] == "26.00"
+
+
+def test_without_variants_every_attribute_lives_on_the_product():
+    attrs, variants = validate_product(SHIRTS, {"size": "M", "color": "Red"}, [], "SHIRT")
+    assert variants == [] and attrs == {"size": "M", "color": "Red"}
+    with pytest.raises(InvalidRequestError, match="'size' is required"):
+        validate_product(SHIRTS, {"color": "Red"}, [], "SHIRT")
+
+
+@pytest.mark.parametrize(
+    "attributes, variants, problem",
+    [
+        ({"size": "M"}, [_variant("A", size="L", color="Red")], "'size' varies per variant"),
+        ({}, [_variant("A", size="M")], "variant A: 'color' is required"),
+        ({}, [_variant("A", size="XL", color="Red")], "variant A: 'size' must be one of"),
+        ({}, [_variant("A", size="M", color="Red", fabric="silk")], "unknown attribute 'fabric'"),
+        ({}, [_variant("A", size="M", color="Red"), _variant("a", size="L", color="Red")], "used twice"),
+        ({}, [_variant("SHIRT", size="M", color="Red")], "equals the product SKU"),
+        ({}, [_variant("A", size="M", color="Red"), _variant("B", size="M", color="Red")], "same options"),
+    ],
+)
+def test_invalid_variants_are_rejected(attributes, variants, problem):
+    assert any(problem in e for e in variant_errors(SHIRTS, attributes, variants, "SHIRT"))
+    with pytest.raises(InvalidRequestError):
+        validate_product(SHIRTS, attributes, variants, "SHIRT")
+
+
+def test_a_type_without_variant_attributes_cannot_have_variants():
+    errors = variant_errors(CLOTHING, {}, [_variant("A", size="M")], "X")
+    assert errors and "no variant attributes" in errors[0]

@@ -25,6 +25,11 @@ class AttributeDef(BaseModel):
         default=None, min_length=1, max_length=50, description="Allowed values; only for type 'choice'."
     )
     unit: str | None = Field(default=None, max_length=20, description="e.g. 'GB' or 'months'")
+    variant: bool = Field(
+        default=False,
+        description="Varies between a product's variants (e.g. size, colour). Products with "
+        "variants set it in each variant's options instead of on the product.",
+    )
 
     @model_validator(mode="after")
     def options_only_for_choice(self):

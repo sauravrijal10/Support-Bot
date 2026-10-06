@@ -15,7 +15,8 @@ MIN_JWT_SECRET_LENGTH = 32
 
 @dataclass(frozen=True)
 class Settings:
-    hf_token: str
+    # HF_TOKEN first, then HF_FALLBACK_TOKENS in order (see app/services/llm.py).
+    hf_tokens: tuple[str, ...]
     database_url: str
     jwt_secret: str
     jwt_expire_minutes: int = 60
@@ -52,8 +53,11 @@ def get_settings() -> Settings:
             f'python -c "import secrets; print(secrets.token_urlsafe(48))"'
         )
 
+    fallbacks = [t.strip() for t in os.environ.get("HF_FALLBACK_TOKENS", "").split(",")]
+    hf_tokens = tuple(dict.fromkeys([hf_token.strip(), *[t for t in fallbacks if t]]))
+
     return Settings(
-        hf_token=hf_token,
+        hf_tokens=hf_tokens,
         database_url=database_url,
         jwt_secret=jwt_secret,
         jwt_expire_minutes=int(os.environ.get("JWT_EXPIRE_MINUTES", "60")),
