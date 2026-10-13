@@ -15,9 +15,13 @@ Protocol (JSON text frames):
   server -> client
     {"type": "ready", "customer": null}
     {"type": "auth_ok", "customer": {...} | null}
-    {"type": "typing"}                      an answer is being prepared
+    {"type": "typing"}                      an answer is being prepared; any
+                                            "delta" text shown so far is void
+    {"type": "delta", "text": "..."}        the next piece of the answer, as
+                                            the model writes it
     {"type": "answer", "answer", "sources", "needs_authentication", "tools_used",
-     "order_form"}                           (same fields as POST /chat)
+     "order_form"}                           (same fields as POST /chat). The
+                                            full answer: it replaces the deltas
     {"type": "reset_ok"} / {"type": "pong"}
     {"type": "error", "code", "detail"}
 
@@ -28,6 +32,7 @@ mid-conversation exactly as it would over HTTP. Changing identity clears
 the history, so one customer's answers are never context for another.
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -100,6 +105,14 @@ class Conversation:
             self.customer = customer
 
         await self.send("typing")
+        loop = asyncio.get_running_loop()
+
+        def on_text(text: str | None) -> None:
+            # Called from the worker thread. Waiting for the send keeps the
+            # frames in order and stops the model call if the client has gone.
+            frame = self.send("typing") if text is None else self.send("delta", text=text)
+            asyncio.run_coroutine_threadsafe(frame, loop).result()
+
         try:
             result = await run_in_threadpool(
                 answer_question,
@@ -109,6 +122,7 @@ class Conversation:
                 query=frame.question,
                 customer=self.customer,
                 history=self.history,
+                on_text=on_text,
             )
         except DomainError as error:
             await self.error("service_unavailable", error.detail)

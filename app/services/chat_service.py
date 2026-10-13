@@ -122,21 +122,23 @@ def _arguments_text(raw) -> str:
 def _assistant_message(message, calls) -> dict:
     """The assistant turn to put back in the history, so the model sees its
     own tool requests next to the results."""
-    return {
-        "role": "assistant",
-        "content": message.content or "",
-        "tool_calls": [
-            {
-                "id": call.id or f"call_{i}",
-                "type": "function",
-                "function": {
-                    "name": call.function.name,
-                    "arguments": _arguments_text(call.function.arguments),
-                },
-            }
-            for i, call in enumerate(calls)
-        ],
-    }
+    tool_calls = []
+    for i, call in enumerate(calls):
+        tool_call = {
+            "id": call.id or f"call_{i}",
+            "type": "function",
+            "function": {
+                "name": call.function.name,
+                "arguments": _arguments_text(call.function.arguments),
+            },
+        }
+        # Provider extras must go back untouched: Gemini rejects the next
+        # request unless a call still carries its thought_signature.
+        extra = getattr(call, "extra_content", None)
+        if extra:
+            tool_call["extra_content"] = extra
+        tool_calls.append(tool_call)
+    return {"role": "assistant", "content": message.content or "", "tool_calls": tool_calls}
 
 
 def _history_messages(history) -> list[dict]:
@@ -159,10 +161,18 @@ def _final_answer(content, ctx: ToolContext) -> str:
     return answer or EMPTY_ANSWER_MESSAGE
 
 
-def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResult:
+def answer_question(llm, kb, db, query, customer=None, history=None, on_text=None) -> ChatResult:
     """`customer` is the authenticated customer (from the bearer token), or
     None for an anonymous caller (who gets FAQ + public product data only).
-    `history` is the conversation so far: a list of {"question", "answer"}."""
+    `history` is the conversation so far: a list of {"question", "answer"}.
+    `on_text`, if given, receives the answer's text as the model writes it
+    (see LLMClient.stream); the returned answer is still the final word."""
+
+    def ask(messages, tools=None):
+        if on_text is None:
+            return llm.complete(messages, tools=tools).choices[0].message
+        return llm.stream(messages, on_text, tools=tools).choices[0].message
+
     if customer is None and needs_account_access(query):
         return ChatResult(answer=LOGIN_REQUIRED_MESSAGE, needs_authentication=True)
 
@@ -195,7 +205,7 @@ def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResu
     seen: set[tuple[str, str]] = set()
 
     for _ in range(MAX_TOOL_STEPS):
-        message = llm.complete(messages, tools=schemas).choices[0].message
+        message = ask(messages, tools=schemas)
         calls = message.tool_calls or []
         if not calls:
             return ChatResult(
@@ -227,7 +237,7 @@ def answer_question(llm, kb, db, query, customer=None, history=None) -> ChatResu
 
     # Step cap reached: ask for a plain answer from what was gathered.
     messages.append({"role": "user", "content": FINAL_ANSWER_NUDGE})
-    message = llm.complete(messages).choices[0].message
+    message = ask(messages)
     return ChatResult(
         answer=_final_answer(message.content, ctx),
         sources=sources,

@@ -12,6 +12,31 @@ from functools import lru_cache
 
 MIN_JWT_SECRET_LENGTH = 32
 
+# Other OpenAI-compatible chat providers, used after the HF tokens in this
+# order. One is switched on by setting <NAME>_API_KEY (comma-separated for
+# several keys); <NAME>_MODEL overrides the default model, which must support
+# tool calling. Values are (chat completions URL, default model).
+FALLBACK_PROVIDERS = {
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "gemini-3.5-flash-lite",
+    ),
+    "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "llama-3.3-70b"),
+    "openrouter": (
+        "https://openrouter.ai/api/v1/chat/completions",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class FallbackLLM:
+    name: str
+    url: str
+    model: str
+    api_keys: tuple[str, ...]
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -25,6 +50,12 @@ class Settings:
     # Pinned provider: "auto" may route to one that doesn't advertise tools.
     llm_model: str = "Qwen/Qwen2.5-72B-Instruct"
     llm_provider: str = "deepinfra"
+    llm_fallbacks: tuple[FallbackLLM, ...] = ()
+
+
+def _split(value: str) -> tuple[str, ...]:
+    """Comma-separated values, without blanks or duplicates."""
+    return tuple(dict.fromkeys(v.strip() for v in value.split(",") if v.strip()))
 
 
 @lru_cache
@@ -53,8 +84,12 @@ def get_settings() -> Settings:
             f'python -c "import secrets; print(secrets.token_urlsafe(48))"'
         )
 
-    fallbacks = [t.strip() for t in os.environ.get("HF_FALLBACK_TOKENS", "").split(",")]
-    hf_tokens = tuple(dict.fromkeys([hf_token.strip(), *[t for t in fallbacks if t]]))
+    hf_tokens = _split(f"{hf_token},{os.environ.get('HF_FALLBACK_TOKENS', '')}")
+    llm_fallbacks = tuple(
+        FallbackLLM(name, url, os.environ.get(f"{name.upper()}_MODEL") or model, keys)
+        for name, (url, model) in FALLBACK_PROVIDERS.items()
+        if (keys := _split(os.environ.get(f"{name.upper()}_API_KEY", "")))
+    )
 
     return Settings(
         hf_tokens=hf_tokens,
@@ -63,4 +98,5 @@ def get_settings() -> Settings:
         jwt_expire_minutes=int(os.environ.get("JWT_EXPIRE_MINUTES", "60")),
         llm_model=os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct"),
         llm_provider=os.environ.get("LLM_PROVIDER", "deepinfra"),
+        llm_fallbacks=llm_fallbacks,
     )

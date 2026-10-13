@@ -84,6 +84,11 @@ install needed.
      for an hour (a minute for rate limits) before being tried again. The
      server log names which token failed (by its last 4 characters only).
      Provider outages (5xx) don't switch tokens -- they'd fail on any.
+   - `GROQ_API_KEY`, `GEMINI_API_KEY`, `CEREBRAS_API_KEY`,
+     `OPENROUTER_API_KEY` (all optional) -- other providers with a free
+     tier, used in that order once every HF token has failed or Hugging
+     Face itself is erroring. Each has a default model, overridable with
+     `<NAME>_MODEL` (it must support tool calling); see `.env.example`.
    - `JWT_SECRET` -- signs login tokens; at least 32 characters. Generate one:
      `python -c "import secrets; print(secrets.token_urlsafe(48))"`
    - `LLM_MODEL` / `LLM_PROVIDER` (optional) -- default to
@@ -258,7 +263,7 @@ history. JSON text frames:
 |---|---|
 | *(on connect)* | `{"type": "ready", "customer": null}` |
 | `{"type": "auth", "token": "<access_token>"}` (`null` signs out) | `{"type": "auth_ok", "customer": {...}}` or an `unauthorized` error |
-| `{"type": "message", "question": "..."}` | `{"type": "typing"}`, then `{"type": "answer", ...}` (same fields as `POST /chat`) |
+| `{"type": "message", "question": "..."}` | `{"type": "typing"}`, then `{"type": "delta", "text": "..."}` frames as the answer is written, then `{"type": "answer", ...}` (same fields as `POST /chat`) with the full answer, which replaces the deltas. A second `typing` means the deltas so far should be dropped |
 | `{"type": "reset"}` | `{"type": "reset_ok"}` -- history forgotten |
 | `{"type": "ping"}` | `{"type": "pong"}` |
 

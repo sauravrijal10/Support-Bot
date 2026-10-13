@@ -31,12 +31,18 @@ class FakeLLM:
     def __init__(self):
         self.requests = []
         self.fail_with = None
+        self.pieces = []  # what stream() passes to on_text before answering
 
     def complete(self, messages, tools=None):
         if self.fail_with:
             raise self.fail_with
         self.requests.append(json.loads(json.dumps(messages)))
         return reply(f"answer {len(self.requests)}")
+
+    def stream(self, messages, on_text, tools=None):
+        for piece in self.pieces:
+            on_text(piece)
+        return self.complete(messages, tools)
 
 
 class FakeKB:
@@ -106,6 +112,21 @@ def test_anonymous_question_is_answered(ws, env):
     assert frame["type"] == "answer" and frame["answer"] == "answer 1"
     assert frame["sources"] == ["faq.md"] and frame["needs_authentication"] is False
     assert "not signed in" in env.llm.requests[0][0]["content"]
+
+
+def test_the_answer_is_streamed_before_the_full_answer_frame(ws, env):
+    # None = the text so far was not the answer after all (see LLMClient.stream).
+    env.llm.pieces = ["Let me check", None, "answer ", "1"]
+    ws.send_json({"type": "message", "question": "What plans do you offer?"})
+    frames = [ws.receive_json() for _ in range(6)]
+    assert frames[:5] == [
+        {"type": "typing"},
+        {"type": "delta", "text": "Let me check"},
+        {"type": "typing"},
+        {"type": "delta", "text": "answer "},
+        {"type": "delta", "text": "1"},
+    ]
+    assert frames[5]["type"] == "answer" and frames[5]["answer"] == "answer 1"
 
 
 def test_anonymous_account_question_is_gated(ws, env):

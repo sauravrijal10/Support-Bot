@@ -327,6 +327,16 @@ def test_no_tool_schema_exposes_a_customer_identifier():
         assert tool.schema()["function"]["parameters"]["type"] == "object", schema_text
 
 
+def test_provider_extras_on_a_tool_call_are_sent_back_with_it():
+    # Gemini rejects the follow-up request unless its thought_signature is returned.
+    extra = {"google": {"thought_signature": "sig"}}
+    signed = NS(id="call_1", function=NS(name="list_product_types", arguments="{}"), extra_content=extra)
+    llm = FakeLLM(reply(calls=[signed, tool_call("search_products", "{}", "call_2")]), reply("done"))
+    ask(llm, "What do you sell?")
+    sent_back = next(m for m in llm.requests[1][0] if m["role"] == "assistant")["tool_calls"]
+    assert sent_back[0]["extra_content"] == extra and "extra_content" not in sent_back[1]
+
+
 def test_schemas_are_flat_and_simple_for_small_models():
     for tool in ALL_TOOLS.values():
         text = json.dumps(tool.schema())
@@ -459,6 +469,138 @@ def test_tokens_from_settings_are_ordered_and_deduplicated(monkeypatch):
     get_settings.cache_clear()
     try:
         assert get_settings().hf_tokens == ("hf_main", "hf_second", "hf_third")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_other_providers_come_after_the_tokens_with_their_own_model(monkeypatch):
+    seen = []
+    groq = NS(chat=NS(completions=NS(create=lambda **kw: seen.append(kw["model"]) or "from groq")))
+    first, second = FlakyClient(http_error(402)), FlakyClient(http_error(402))
+    monkeypatch.setattr("app.services.llm.time.sleep", lambda s: None)
+    llm = LLMClient.with_clients("m", [first, second], {"groq": groq})
+    assert llm.complete([]) == "from groq" and seen == ["groq-model"]
+
+
+@pytest.mark.parametrize("error", [http_error(500), http_error(404), httpx.ConnectError("boom")])
+def test_a_provider_side_failure_moves_on_to_another_provider(monkeypatch, error):
+    monkeypatch.setattr("app.services.llm.time.sleep", lambda s: None)
+    first, second, groq = FlakyClient(error, error), FlakyClient("unused"), FlakyClient("from groq")
+    llm = LLMClient.with_clients("m", [first, second], {"groq": groq})
+    assert llm.complete([]) == "from groq" and second.calls == 0
+
+
+def test_the_openai_compatible_client_parses_answers_and_raises_like_the_hf_one():
+    from app.services.llm import _OpenAICompatibleClient
+
+    answer = {"choices": [{"message": {"role": "assistant", "content": "hi", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "get_order", "arguments": "{}"}}]}}]}
+    replies = [httpx.Response(200, json=answer), httpx.Response(429, json=[{"error": {"code": 429}}])]
+    client = _OpenAICompatibleClient("https://x/chat/completions", "key")
+    client._http = httpx.Client(transport=httpx.MockTransport(lambda request: replies.pop(0)))
+    message = client.chat.completions.create(model="m", messages=[]).choices[0].message
+    assert message.content == "hi" and message.tool_calls[0].function.name == "get_order"
+    with pytest.raises(HfHubHTTPError) as raised:
+        client.chat.completions.create(model="m", messages=[])
+    assert raised.value.response.status_code == 429
+
+
+def chunk(content=None, calls=None):
+    return NS(choices=[NS(delta=NS(content=content, tool_calls=calls))])
+
+
+def call_part(index, call_id=None, name=None, arguments=None, **extra):
+    return NS(index=index, id=call_id, function=NS(name=name, arguments=arguments), **extra)
+
+
+class StreamingClient(FlakyClient):
+    """Each outcome is an error to raise or a list of chunks; an error inside
+    the list is raised part-way through the stream."""
+
+    def _create(self, stream=False, **kwargs):
+        outcome = super()._create(**kwargs)
+        assert stream
+
+        def chunks():
+            for item in outcome:
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+
+        return chunks()
+
+
+def test_streaming_passes_text_on_as_it_arrives_and_returns_the_whole_answer(monkeypatch):
+    seen = []
+    client = StreamingClient([chunk("Hel"), chunk("lo"), NS(choices=[])])
+    message = llm_with(client, monkeypatch).stream([], seen.append).choices[0].message
+    assert seen == ["Hel", "lo"] and message.content == "Hello" and message.tool_calls is None
+
+
+def test_streamed_tool_calls_are_put_together_and_text_before_them_is_taken_back(monkeypatch):
+    seen = []
+    extra = {"google": {"thought_signature": "sig"}}
+    client = StreamingClient([
+        chunk("Let me check"),
+        chunk(calls=[call_part(0, "c1", "get_order", '{"order'), call_part(1, "c2", "list_my_orders", "{}")]),
+        chunk(calls=[call_part(0, arguments='_id": 8}', extra_content=extra)]),
+    ])
+    first, second = llm_with(client, monkeypatch).stream([], seen.append).choices[0].message.tool_calls
+    assert (first.id, first.function.name, first.function.arguments) == ("c1", "get_order", '{"order_id": 8}')
+    assert first.extra_content == extra and second.function.name == "list_my_orders"
+    assert seen == ["Let me check", None]
+
+
+def test_a_stream_that_breaks_part_way_starts_over_on_another_provider(monkeypatch):
+    seen = []
+    broken = [chunk("Hel"), httpx.ReadError("boom")]
+    first, groq = StreamingClient(broken, broken), StreamingClient([chunk("Hi")])
+    monkeypatch.setattr("app.services.llm.time.sleep", lambda s: None)
+    llm = LLMClient.with_clients("m", [first], {"groq": groq})
+    assert llm.stream([], seen.append).choices[0].message.content == "Hi"
+    assert seen == ["Hel", None, "Hel", None, "Hi"]
+
+
+def test_the_openai_compatible_client_reads_a_stream_and_its_errors():
+    from app.services.llm import _OpenAICompatibleClient
+
+    events = (
+        'data: {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hi"}}]}\n\n'
+        ': keep-alive\n\n'
+        'data: {"choices": [{"index": 0, "delta": {"tool_calls": [{"function": {"name": "get_order", '
+        '"arguments": "{}"}, "id": "c1", "type": "function", "extra_content": {"google": {}}}]}}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+    replies = [httpx.Response(200, text=events), httpx.Response(429, json=[{"error": {"code": 429}}])]
+    client = _OpenAICompatibleClient("https://x/chat/completions", "key")
+    client._http = httpx.Client(transport=httpx.MockTransport(lambda request: replies.pop(0)))
+    text, calls = list(client.chat.completions.create(model="m", messages=[], stream=True))
+    assert text.choices[0].delta.content == "Hi"
+    assert calls.choices[0].delta.tool_calls[0].function.name == "get_order"
+    with pytest.raises(HfHubHTTPError) as raised:
+        list(client.chat.completions.create(model="m", messages=[], stream=True))
+    assert raised.value.response.status_code == 429
+
+
+def test_fallback_providers_from_settings(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("HF_TOKEN", "hf_main")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("JWT_SECRET", "s" * 40)
+    for name in ("GROQ", "GEMINI", "CEREBRAS", "OPENROUTER"):
+        monkeypatch.delenv(f"{name}_API_KEY", raising=False)
+        monkeypatch.delenv(f"{name}_MODEL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or_key")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_a, gsk_b")
+    monkeypatch.setenv("GROQ_MODEL", "some-model")
+    get_settings.cache_clear()
+    try:
+        groq, openrouter = get_settings().llm_fallbacks
+        assert (groq.name, groq.model, groq.api_keys) == ("groq", "some-model", ("gsk_a", "gsk_b"))
+        assert openrouter.name == "openrouter" and openrouter.model.endswith(":free")
+        llm = LLMClient("hf_main", "m", "deepinfra", get_settings().llm_fallbacks)
+        assert [t.provider for t in llm._tokens] == ["huggingface", "groq", "groq", "openrouter"]
     finally:
         get_settings.cache_clear()
 

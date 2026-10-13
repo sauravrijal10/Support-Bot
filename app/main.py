@@ -46,7 +46,9 @@ async def lifespan(app: FastAPI):
     app.state.session_factory = session_factory
     app.state.db = Database(session_factory)
     app.state.kb = kb
-    app.state.llm = LLMClient(list(settings.hf_tokens), settings.llm_model, settings.llm_provider)
+    app.state.llm = LLMClient(
+        list(settings.hf_tokens), settings.llm_model, settings.llm_provider, settings.llm_fallbacks
+    )
 
     yield
 

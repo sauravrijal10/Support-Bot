@@ -337,6 +337,24 @@
     scrollDown();
   }
 
+  // The answer as it is being written; the "answer" frame replaces it.
+  function addDelta(text) {
+    let m = log.querySelector(".streaming");
+    if (!m) {
+      setTyping(false);
+      m = el("div", "msg bot streaming");
+      m.append(el("div", "bubble", ""));
+      log.append(m);
+    }
+    m.firstChild.textContent += text;
+    scrollDown();
+  }
+
+  function clearDelta() {
+    const m = log.querySelector(".streaming");
+    if (m) m.remove();
+  }
+
   function setTyping(on) {
     const existing = log.querySelector(".typing");
     if (on && !existing) {
@@ -518,13 +536,19 @@
         case "auth_ok":
           break;
         case "typing":
+          clearDelta();
           setTyping(true);
           break;
+        case "delta":
+          addDelta(frame.text);
+          break;
         case "answer":
+          clearDelta();
           setBusy(false);
           addBot(frame);
           break;
         case "error":
+          clearDelta();
           setBusy(false);
           if (frame.code === "unauthorized") signOut("Your session expired. Please sign in again.");
           else addSystem(frame.detail || "Something went wrong.", true);
@@ -535,6 +559,7 @@
     ws.onclose = () => {
       if (state.ws !== ws) return;
       state.ws = null; state.wsReady = false;
+      clearDelta();
       if (state.busy) { setBusy(false); addSystem("Connection lost before an answer arrived.", true); }
       if (state.mode !== "ws") return;
       const delay = Math.min(30000, 1000 * 2 ** state.retry++);

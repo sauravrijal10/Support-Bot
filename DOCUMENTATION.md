@@ -340,7 +340,7 @@ Errors: `422` (validation, unknown/inactive product or variant, missing variant)
   "tools_used": ["search_products", "prepare_order"], "order_form": { ... } | null }
 ```
 
-**`WS /ws/chat`** — client frames: `auth {token}`, `message {question}`, `reset`, `ping`. Server frames: `ready`, `auth_ok`, `typing`, `answer` (same fields as `POST /chat`), `reset_ok`, `pong`, `error {code, detail}` with codes `unauthorized`, `invalid_frame`, `service_unavailable`, `internal_error`.
+**`WS /ws/chat`** — client frames: `auth {token}`, `message {question}`, `reset`, `ping`. Server frames: `ready`, `auth_ok`, `typing`, `delta {text}` (the answer as it is written; a later `typing` voids it), `answer` (same fields as `POST /chat`; replaces the deltas), `reset_ok`, `pong`, `error {code, detail}` with codes `unauthorized`, `invalid_frame`, `service_unavailable`, `internal_error`.
 
 | Caller | Message | Result |
 |---|---|---|
@@ -362,6 +362,7 @@ Errors: `422` (validation, unknown/inactive product or variant, missing variant)
 |---|---|
 | `HF_TOKEN` | Hugging Face token with "Make calls to Inference Providers". **Billed.** |
 | `HF_FALLBACK_TOKENS` | Optional, comma-separated extra tokens (ideally other accounts) used on 401/402/403/429 |
+| `GROQ_API_KEY`, `GEMINI_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY` | Optional free-tier providers, used in that order after the HF tokens; `<NAME>_MODEL` overrides each default model |
 | `LLM_MODEL` / `LLM_PROVIDER` | Default `Qwen/Qwen2.5-72B-Instruct` / `deepinfra`; the pair must support tool calling |
 | `JWT_SECRET` | Required, ≥ 32 characters; changing it logs everyone out |
 | `JWT_EXPIRE_MINUTES` | Token lifetime, default 60 |
