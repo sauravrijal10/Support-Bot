@@ -16,6 +16,9 @@ SECURITY MODEL -- read before adding a tool:
   server refuses unless that was shown in an earlier turn AND the customer's
   current message is a plain "yes" (app/services/order_drafts.py,
   order_cancellations.py). The model alone can't order or cancel anything.
+  (After a product search a signed-in customer is also shown a cart; the model
+  doesn't control it and nothing is ordered unless the customer fills it in
+  and presses the button.)
 * Anonymous callers are only offered public tools, and `run_tool` re-checks
   that even if the model names a tool it wasn't offered.
 * Arguments are validated; tool failures become an error *result* the model
@@ -43,6 +46,14 @@ MAX_RESULT_CHARS = 6000
 MAX_TEXT_CHARS = 200
 
 
+CART_NOTE = (
+    "The products that are in stock are shown to the customer in a cart below your reply, "
+    "with every option, its price and a quantity box, and a button to place the order. "
+    "Answer in one or two plain sentences and point them to the cart: no table, no list "
+    "of SKUs or prices."
+)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -54,6 +65,7 @@ class ToolContext:
     user_message: str = ""  # the customer's message this request answers
     started_at: datetime = field(default_factory=_utcnow)  # when this request began
     order_form: dict | None = None  # set by prepare_order; shown to the customer as a form
+    cart_skus: list[str] = field(default_factory=list)  # buyable products of the latest search
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +239,13 @@ def _search_products(ctx: ToolContext, args: SearchProductsArgs) -> dict:
             item["units_left"] = p["stock_quantity"]
         products.append(item)
     result = {"total_matches": total, "shown": len(products), "products": products}
+
+    # A signed-in customer gets what was found as a cart (chat_service builds
+    # it after the answer), so the model shouldn't spell the list out again.
+    if ctx.customer is not None:
+        ctx.cart_skus = [p["sku"] for p in rows if _available(p)]
+        if ctx.cart_skus:
+            result["display"] = CART_NOTE
 
     # Models often set in_stock_only for "is X available?". Then X, if sold
     # out, would look like it doesn't exist -- so name what was filtered out.

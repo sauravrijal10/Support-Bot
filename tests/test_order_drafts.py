@@ -23,6 +23,7 @@ from app.services.order_drafts import (
     confirm_form,
     discard_form,
     is_confirmation,
+    prepare_cart,
     prepare_draft,
 )
 
@@ -288,3 +289,48 @@ def test_discarding_the_form(session, shop):
     discard_form(session, shop["customer"], draft_id, LATER)
     assert drafts(session, shop["customer"])[0].status == "superseded"
     assert confirm_draft(session, shop["customer"], LATER, LATER)["placed"] is False  # "yes" can't revive it
+
+
+# ---------------------------------------------------------------- the cart (products just shown)
+
+
+def test_a_cart_lists_buyable_products_at_quantity_zero(session, shop):
+    form = prepare_cart(
+        session, shop["customer"], ["TEST-SHIRT", "TEST-TEE", "TEST-GONE", "NOPE", "test-tee"], T0
+    )
+    assert form["kind"] == "cart" and form["total"] == "0.00"
+    shirt, tee = form["lines"]  # withdrawn, unknown and repeated products are left out
+    assert (shirt["sku"], shirt["quantity"]) == ("TEST-SHIRT-M", 0)  # an in-stock size preselected
+    assert [(o["sku"], o["max_quantity"]) for o in shirt["options"]] == [("TEST-SHIRT-M", 5), ("TEST-SHIRT-L", 0)]
+    assert (tee["sku"], tee["quantity"]) == ("TEST-TEE", 0)
+    assert shop["tee"].stock_quantity == 5
+    assert session.scalar(select(Order.id).where(Order.customer_id == shop["customer"])) is None
+
+
+def test_no_cart_when_nothing_can_be_bought(session, shop):
+    shop["tee"].stock_quantity = 0
+    assert prepare_cart(session, shop["customer"], ["TEST-TEE", "TEST-GONE"], T0) is None
+    assert drafts(session, shop["customer"]) == []
+
+
+def test_a_yes_in_the_chat_cannot_place_a_cart(session, shop):
+    prepare_cart(session, shop["customer"], ["TEST-TEE"], T0)
+    result = confirm_draft(session, shop["customer"], request_started_at=LATER, now=LATER)
+    assert result["placed"] is False and "no order waiting" in result["reason"]
+    assert shop["tee"].stock_quantity == 5
+
+
+def test_a_cart_retires_an_earlier_quote(session, shop):
+    old = prepare_draft(session, shop["customer"], [("TEST-TEE", 1)], T0)["form"]["draft_id"]
+    prepare_cart(session, shop["customer"], ["TEST-EBOOK"], LATER)
+    assert confirm_draft(session, shop["customer"], LATER, LATER)["placed"] is False
+    with pytest.raises(ConflictError):
+        confirm_form(session, shop["customer"], old, [("TEST-TEE", 1)], Decimal("24.00"), LATER)
+
+
+def test_ordering_from_the_cart(session, shop):
+    form = prepare_cart(session, shop["customer"], ["TEST-SHIRT", "TEST-TEE"], T0)
+    order = confirm_form(session, shop["customer"], form["draft_id"], [("TEST-SHIRT-M", 2)], Decimal("48.00"), T0)
+    assert order.total_amount == Decimal("48.00") and [i.variant_sku for i in order.items] == ["TEST-SHIRT-M"]
+    with pytest.raises(ConflictError):  # single use, like any form
+        confirm_form(session, shop["customer"], form["draft_id"], [("TEST-TEE", 1)], Decimal("24.00"), LATER)

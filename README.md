@@ -317,6 +317,18 @@ customer never pays a total they didn't see. A form can be used once, only
 by its customer, for 15 minutes, and a newer quote retires older forms.
 Replying "yes" in the chat still works too (for text-only clients).
 
+**The cart (products you were shown).** When a signed-in customer asks what
+is for sale ("show me the hoodies") and `search_products` finds something in
+stock, the answer carries the same `order_form` with `"kind": "cart"`: one line
+per product found, every quantity `0`, an in-stock option preselected. The chat
+page shows it as a **Cart** card instead of the bot listing everything as text;
+the customer picks options, enters quantities and presses **Place order**, which
+calls the same `/orders/drafts/{draft_id}/confirm` with only the lines they
+filled in. A cart is saved as a draft with no lines, so replying "yes" in the
+chat can't place it -- nothing was asked for yet. Signed-out callers get no cart
+(ordering needs a login), and a cart is not added when the bot prepared an order
+form, placed an order or handled a cancellation in the same reply.
+
 A new quote replaces the customer's previous open draft, a draft can only be
 placed once (row lock), and stock is re-checked when placing. Orders placed
 this way are normal `pending` orders, so the customer can still cancel them.

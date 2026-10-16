@@ -18,10 +18,14 @@ request the fixed, read-only tools in app/services/tools.py.
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from app.services.customer_lookup import needs_account_access
 from app.services.tools import ToolContext, run_tool, tools_for
+
+logger = logging.getLogger(__name__)
 
 FAQ_CHUNKS = 3
 MAX_TOOL_STEPS = 4  # model round-trips that may request tools
@@ -61,6 +65,9 @@ You have tools that look up live data. Rules:
   Call search_products(query="hoodie"), then prepare_order with the best match and
   quantity 1, then reply: "I've put a hoodie in an order form below -- choose the
   size and quantity there and press Confirm."
+- When a search_products result has a "display" note, the customer sees those
+  products in a cart under your reply. Answer what they asked in a sentence or two
+  and point them to the cart; don't repeat the products as a table or list.
 - To cancel an order: call request_cancellation with the order number (use
   list_my_orders if the customer doesn't give one), show them the order and ask
   them to confirm. Call confirm_cancellation only after they say yes in their next
@@ -86,6 +93,14 @@ ORDER_FORM_MESSAGE = (
     "total and press Confirm."
 )
 
+CART_MESSAGE = (
+    "Here's what we have -- choose the options and quantities in the cart below and "
+    "press Place order."
+)
+
+# After these, the customer is in the middle of something else: no cart.
+NO_CART_AFTER = {"confirm_order", "request_cancellation", "confirm_cancellation"}
+
 FINAL_ANSWER_NUDGE = (
     "Answer the customer now using the tool results above. Do not call any more tools."
 )
@@ -97,7 +112,7 @@ class ChatResult:
     sources: list[str] = field(default_factory=list)
     needs_authentication: bool = False
     tools_used: list[str] = field(default_factory=list)
-    order_form: dict | None = None  # an order to confirm, for clients that show forms
+    order_form: dict | None = None  # an order to confirm or a cart, for clients that show forms
 
 
 def build_context_block(results):
@@ -157,8 +172,24 @@ def _final_answer(content, ctx: ToolContext) -> str:
     # With an order form attached, the model sometimes says next to nothing
     # ("[Order Form]"); the form needs a sentence pointing at it.
     if ctx.order_form is not None and (len(answer) < 25 or answer.startswith("[")):
-        return ORDER_FORM_MESSAGE
+        return CART_MESSAGE if ctx.order_form.get("kind") == "cart" else ORDER_FORM_MESSAGE
     return answer or EMPTY_ANSWER_MESSAGE
+
+
+def _add_cart(ctx: ToolContext, tools_used: list[str]) -> None:
+    """Products a signed-in customer was just shown become a cart form, unless
+    the model already prepared an order form. The answer stands without it,
+    so a failure here is only logged."""
+    if ctx.order_form is not None or ctx.customer is None or not ctx.cart_skus:
+        return
+    if NO_CART_AFTER.intersection(tools_used):
+        return
+    try:
+        ctx.order_form = ctx.db.prepare_cart(
+            ctx.customer["id"], ctx.cart_skus, datetime.now(timezone.utc)
+        )
+    except Exception:
+        logger.exception("Could not build the cart")
 
 
 def answer_question(llm, kb, db, query, customer=None, history=None, on_text=None) -> ChatResult:
@@ -208,6 +239,7 @@ def answer_question(llm, kb, db, query, customer=None, history=None, on_text=Non
         message = ask(messages, tools=schemas)
         calls = message.tool_calls or []
         if not calls:
+            _add_cart(ctx, tools_used)
             return ChatResult(
                 answer=_final_answer(message.content, ctx),
                 sources=sources,
@@ -238,6 +270,7 @@ def answer_question(llm, kb, db, query, customer=None, history=None, on_text=Non
     # Step cap reached: ask for a plain answer from what was gathered.
     messages.append({"role": "user", "content": FINAL_ANSWER_NUDGE})
     message = ask(messages)
+    _add_cart(ctx, tools_used)
     return ChatResult(
         answer=_final_answer(message.content, ctx),
         sources=sources,

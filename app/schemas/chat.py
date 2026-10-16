@@ -46,6 +46,11 @@ class OrderForm(BaseModel):
     """An order the assistant prepared. Show it as a form (option, quantity,
     live total), then POST /orders/drafts/{draft_id}/confirm or /discard."""
 
+    kind: Literal["order", "cart"] = Field(
+        default="order",
+        description="'order': what the customer asked to buy. 'cart': products they were "
+        "shown, every quantity 0 -- send only the lines they gave a quantity.",
+    )
     draft_id: int
     lines: list[OrderFormLine]
     total: str
@@ -67,7 +72,9 @@ class ChatResponse(BaseModel):
         description="Names of the lookup tools the assistant called to answer (for transparency).",
     )
     order_form: OrderForm | None = Field(
-        default=None, description="Present when the assistant prepared an order to confirm."
+        default=None,
+        description="Present when the assistant prepared an order to confirm, or showed "
+        "products a signed-in customer can order.",
     )
 
 

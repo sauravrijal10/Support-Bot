@@ -25,7 +25,7 @@ from app.services.chat_service import (
 )
 from app.services.errors import ServiceUnavailableError
 from app.services.llm import LLMClient
-from app.services.tools import ALL_TOOLS, ToolContext, run_tool, search_terms, tools_for
+from app.services.tools import ALL_TOOLS, CART_NOTE, ToolContext, run_tool, search_terms, tools_for
 
 ADA = {"id": 1, "name": "Ada Lovelace", "email": "ada@example.com", "plan": "pro", "is_admin": False}
 WHEN = datetime(2026, 9, 15)
@@ -67,6 +67,7 @@ class FakeDB:
         self.order_lookups = []
         self.product_searches = []
         self.drafts = []
+        self.carts = []
         self.confirms = []
         self.cancel_requests = []
         self.cancel_confirms = []
@@ -102,6 +103,12 @@ class FakeDB:
     def prepare_order_draft(self, customer_id, lines, now):
         self.drafts.append((customer_id, lines))
         return {"draft_ready": True, "total": "48.00", "form": {"draft_id": 7, "lines": [], "total": "48.00"}}
+
+    def prepare_cart(self, customer_id, skus, now):
+        self.carts.append((customer_id, skus))
+        if self.fail:
+            raise RuntimeError("db exploded")
+        return {"kind": "cart", "draft_id": 11, "lines": [], "total": "0.00"}
 
     def confirm_order_draft(self, customer_id, request_started_at, now):
         self.confirms.append((customer_id, request_started_at))
@@ -701,3 +708,53 @@ def test_a_form_with_an_empty_reply_gets_a_sentence_pointing_at_it():
     llm = FakeLLM(reply(calls=[tool_call("prepare_order", '{"items": [{"sku": "HOODIE"}]}')]), reply("[Order Form]"))
     result, _ = ask(llm, "I'd like a hoodie")
     assert result.answer == chat_service.ORDER_FORM_MESSAGE and result.order_form is not None
+
+
+# ---------------------------------------------------------------- the cart
+
+
+SEARCH = tool_call("search_products", '{"query": "plan"}')
+
+
+def test_products_shown_to_a_signed_in_customer_come_with_a_cart():
+    llm = FakeLLM(reply(calls=[SEARCH]), reply("We have the Plus plan -- see the cart below."))
+    result, db = ask(llm, "Which plans do you sell?")
+    assert db.carts == [(ADA["id"], ["PLUS-PLAN"])]
+    assert result.order_form["kind"] == "cart"
+    # The model is told the customer sees a cart, so it doesn't list everything again.
+    assert json.loads(llm.requests[1][0][-1]["content"])["display"] == CART_NOTE
+
+
+def test_signed_out_callers_get_no_cart():
+    llm = FakeLLM(reply(calls=[SEARCH]), reply("We have the Plus plan."))
+    result, db = ask(llm, "Which plans do you sell?", customer=None)
+    assert db.carts == [] and result.order_form is None
+    assert "display" not in json.loads(llm.requests[1][0][-1]["content"])
+
+
+def test_an_order_form_is_not_replaced_by_a_cart():
+    prepare = tool_call("prepare_order", '{"items": [{"sku": "PLUS-PLAN", "quantity": 1}]}', "call_2")
+    llm = FakeLLM(reply(calls=[SEARCH]), reply(calls=[prepare]), reply("Review and confirm the form."))
+    result, db = ask(llm, "I'd like the Plus plan")
+    assert db.carts == [] and result.order_form["draft_id"] == 7
+
+
+def test_no_cart_while_confirming_or_cancelling():
+    confirm = tool_call("confirm_order", "{}", "call_2")
+    llm = FakeLLM(reply(calls=[SEARCH, confirm]), reply("Done! Order 9."))
+    result, db = ask(llm, "Yes, place it please")
+    assert db.carts == [] and result.order_form is None
+
+
+def test_a_failing_cart_does_not_lose_the_answer():
+    db = FakeDB()
+    llm = FakeLLM(reply(calls=[SEARCH]), reply("We have the Plus plan."))
+    db.fail = True
+    result, _ = ask(llm, "Which plans do you sell?", db=db)
+    assert result.answer == "We have the Plus plan." and result.order_form is None
+
+
+def test_a_cart_with_an_empty_reply_gets_a_sentence_pointing_at_it():
+    llm = FakeLLM(reply(calls=[SEARCH]), reply(""))
+    result, _ = ask(llm, "Which plans do you sell?")
+    assert result.answer == chat_service.CART_MESSAGE

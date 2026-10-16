@@ -22,7 +22,7 @@ from app.models import Customer, Order, Product, ProductType, Ticket
 from app.services import variants as variant_rules
 from app.services.catalog import describe_attributes
 from app.services.order_cancellations import confirm_cancellation, request_cancellation
-from app.services.order_drafts import confirm_draft, prepare_draft
+from app.services.order_drafts import confirm_draft, prepare_cart, prepare_draft
 
 # Cap on rows fed into the model's context per list.
 MAX_ROWS = 20
@@ -223,6 +223,13 @@ class Database:
             result = prepare_draft(session, customer_id, lines, now)
             session.commit()
             return result
+
+    def prepare_cart(self, customer_id, skus, now):
+        """A cart form for products the customer was shown (see order_drafts.prepare_cart)."""
+        with self._session_factory() as session:
+            form = prepare_cart(session, customer_id, skus, now)
+            session.commit()
+            return form
 
     def confirm_order_draft(self, customer_id, request_started_at, now):
         """Place the customer's open draft (see order_drafts.confirm_draft)."""

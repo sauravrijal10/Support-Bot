@@ -1,37 +1,3 @@
-"""
-app/api/routes/chat_ws.py
-
-WebSocket chat: one connection is one conversation. The server keeps the
-history, so the client only sends each new question.
-
-Protocol (JSON text frames):
-
-  client -> server
-    {"type": "auth", "token": "<jwt>"}     sign in (token=null signs out)
-    {"type": "message", "question": "..."}  ask something
-    {"type": "reset"}                       forget the conversation
-    {"type": "ping"}
-
-  server -> client
-    {"type": "ready", "customer": null}
-    {"type": "auth_ok", "customer": {...} | null}
-    {"type": "typing"}                      an answer is being prepared; any
-                                            "delta" text shown so far is void
-    {"type": "delta", "text": "..."}        the next piece of the answer, as
-                                            the model writes it
-    {"type": "answer", "answer", "sources", "needs_authentication", "tools_used",
-     "order_form"}                           (same fields as POST /chat). The
-                                            full answer: it replaces the deltas
-    {"type": "reset_ok"} / {"type": "pong"}
-    {"type": "error", "code", "detail"}
-
-The token goes in a frame rather than the URL so it never lands in access
-logs, and browsers cannot set an Authorization header on a WebSocket.
-It is re-checked before every question, so an expired token stops working
-mid-conversation exactly as it would over HTTP. Changing identity clears
-the history, so one customer's answers are never context for another.
-"""
-
 import asyncio
 import logging
 

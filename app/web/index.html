@@ -221,8 +221,11 @@
 
   function renderOrderForm(form) {
     if (activeForm) activeForm.retire("Replaced by a newer order form.");
+    // A cart lists products the customer was shown, all at quantity 0; an
+    // order form holds what they asked to buy. Lines left at 0 aren't sent.
+    const isCart = form.kind === "cart";
     const card = el("div", "order-card");
-    card.append(el("h3", null, "Your order"));
+    card.append(el("h3", null, isCart ? "Cart" : "Your order"));
     const rows = [];
 
     for (const line of form.lines) {
@@ -239,7 +242,7 @@
       }
       const qtyLabel = el("label", "qty-label", "Quantity");
       const qty = el("input");
-      qty.type = "number"; qty.min = "1"; qty.value = String(line.quantity);
+      qty.type = "number"; qty.min = "0"; qty.value = String(line.quantity);
       qty.setAttribute("aria-label", "Quantity");
       const lineTotal = el("div", "line-total");
       row.append(select, qtyLabel, qty, lineTotal);
@@ -253,27 +256,29 @@
     const note = el("div", "order-note",
       `Prices are checked again when you confirm. This form is valid until ${new Date(form.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`);
     const actions = el("div", "order-actions");
-    const cancelBtn = el("button", null, "Cancel"); cancelBtn.type = "button";
-    const confirmBtn = el("button", "primary", "Confirm order"); confirmBtn.type = "button";
+    const cancelBtn = el("button", null, isCart ? "Dismiss" : "Cancel"); cancelBtn.type = "button";
+    const confirmBtn = el("button", "primary", isCart ? "Place order" : "Confirm order"); confirmBtn.type = "button";
     actions.append(cancelBtn, confirmBtn);
     card.append(totalRow, note, actions);
 
     let total = 0;
     function recalc() {
       total = 0;
-      let valid = true;
+      let valid = true, units = 0;
       for (const r of rows) {
         const option = r.options.find((o) => o.sku === r.select.value);
         r.qty.max = String(option.max_quantity);
         let q = parseInt(r.qty.value, 10);
-        if (!Number.isInteger(q) || q < 1) { valid = false; q = 0; }
+        if (!Number.isInteger(q) || q < 0) { valid = false; q = 0; }
         if (q > option.max_quantity) { q = option.max_quantity; r.qty.value = String(q); }
         const line = cents(option.unit_price) * q;
-        r.lineTotal.textContent = q ? `${q} × $${option.unit_price} = ${money(line)}` : "Enter a quantity";
+        r.lineTotal.textContent = q ? `${q} × $${option.unit_price} = ${money(line)}`
+          : option.max_quantity ? "Enter a quantity" : "Sold out";
         total += line;
+        units += q;
       }
       totalValue.textContent = money(total);
-      confirmBtn.disabled = !valid || busy;
+      confirmBtn.disabled = !valid || !units || busy;
     }
 
     let busy = false;
@@ -299,7 +304,9 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            items: rows.map((r) => ({ sku: r.select.value, quantity: parseInt(r.qty.value, 10) })),
+            items: rows
+              .map((r) => ({ sku: r.select.value, quantity: parseInt(r.qty.value, 10) }))
+              .filter((item) => item.quantity > 0),
             expected_total: (total / 100).toFixed(2),
           }),
         });
@@ -310,7 +317,7 @@
         busy = false;
         if (err.status === 401) { signOut("Your session expired. Please sign in again."); return; }
         if (err.status === 404 || err.status === 409) {
-          lock(err.message + " Ask the assistant for an updated order form.", true);
+          lock(err.message + (isCart ? " Ask the assistant to show the products again." : " Ask the assistant for an updated order form."), true);
         } else {
           note.className = "order-note error"; note.textContent = err.message;
           cancelBtn.disabled = false; recalc();
@@ -323,7 +330,7 @@
       try {
         await api(`/orders/drafts/${form.draft_id}/discard`, { method: "POST" });
       } catch {}
-      lock("Order cancelled — nothing was ordered.");
+      lock(isCart ? "Cart dismissed — nothing was ordered." : "Order cancelled — nothing was ordered.");
     };
 
     recalc();

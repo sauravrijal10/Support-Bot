@@ -23,6 +23,11 @@ button. That goes through confirm_form / discard_form via the
 REST API: a click by the signed-in customer is itself the confirmation, and
 the total the customer saw must still be the total.
 
+prepare_cart makes the same form for products the customer was only SHOWN (a
+product search): every quantity starts at 0 and the customer fills it in. Its
+draft has no lines, so it can be placed from the form but never by a "yes" in
+the chat -- the customer hasn't asked for anything yet.
+
 Like orders.py, functions here don't commit; the caller does.
 """
 
@@ -80,27 +85,48 @@ def _item_sku(product, variant) -> str:
     return variant["sku"] if variant else product.sku
 
 
+def _form_line(product, sku: str, quantity: int) -> dict:
+    """One line of a form: the selected SKU and everything it could be instead."""
+    return {
+        "sku": sku,
+        "quantity": quantity,
+        "options": [
+            {"sku": _item_sku(p, v), "name": variants.display_name(p, v),
+             "unit_price": str(variants.unit_price(p, v)),
+             "billing_period": p.billing_period, "max_quantity": _max_quantity(p, v)}
+            for p, v in variants.sellable_items(product)
+        ],
+    }
+
+
 def _form(draft: OrderDraft, chosen: dict) -> dict:
     """chosen: item SKU -> product, for each draft line."""
-    lines = []
-    for line in draft.lines:
-        product = chosen[line["sku"]]
-        lines.append({
-            "sku": line["sku"],
-            "quantity": line["quantity"],
-            "options": [
-                {"sku": _item_sku(p, v), "name": variants.display_name(p, v),
-                 "unit_price": str(variants.unit_price(p, v)),
-                 "billing_period": p.billing_period, "max_quantity": _max_quantity(p, v)}
-                for p, v in variants.sellable_items(product)
-            ],
-        })
     return {
+        "kind": "order",
         "draft_id": draft.id,
-        "lines": lines,
+        "lines": [_form_line(chosen[l["sku"]], l["sku"], l["quantity"]) for l in draft.lines],
         "total": str(draft.total_amount),
         "expires_at": draft.expires_at.isoformat(),
     }
+
+
+def _new_draft(
+    session: Session, customer_id: int, lines: list, total: Decimal, now: datetime
+) -> OrderDraft:
+    # One open draft per customer: a new quote replaces any earlier one, so
+    # "confirm" can never place a stale order the customer moved on from.
+    session.execute(
+        update(OrderDraft)
+        .where(OrderDraft.customer_id == customer_id, OrderDraft.status == "open")
+        .values(status="superseded")
+    )
+    draft = OrderDraft(
+        customer_id=customer_id, lines=lines, total_amount=total, status="open",
+        created_at=now, expires_at=now + DRAFT_LIFETIME,
+    )
+    session.add(draft)
+    session.flush()
+    return draft
 
 
 def _order_summary(order) -> dict:
@@ -184,19 +210,7 @@ def prepare_draft(
         chosen[sku] = product
         total += price * quantity
 
-    # One open draft per customer: a new quote replaces any earlier one, so
-    # "confirm" can never place a stale order the customer moved on from.
-    session.execute(
-        update(OrderDraft)
-        .where(OrderDraft.customer_id == customer_id, OrderDraft.status == "open")
-        .values(status="superseded")
-    )
-    draft = OrderDraft(
-        customer_id=customer_id, lines=draft_lines, total_amount=total, status="open",
-        created_at=now, expires_at=now + DRAFT_LIFETIME,
-    )
-    session.add(draft)
-    session.flush()
+    draft = _new_draft(session, customer_id, draft_lines, total, now)
 
     return {
         "draft_ready": True,
@@ -217,6 +231,41 @@ def prepare_draft(
     }
 
 
+def prepare_cart(session: Session, customer_id: int, skus: list[str], now: datetime) -> dict | None:
+    """A cart form for these products (SKUs from a product search), each at
+    quantity 0 with an in-stock option preselected. Products that can't be
+    bought right now are left out. Returns the form, or None -- with nothing
+    saved -- if none of them can."""
+    lines, seen = [], set()
+    for sku in skus:
+        resolved = variants.resolve_sku(session, sku)
+        if resolved is None:
+            continue
+        product = resolved[0]
+        if not product.is_active or product.id in seen:
+            continue
+        in_stock = [(p, v) for p, v in variants.sellable_items(product) if _max_quantity(p, v) > 0]
+        if not in_stock:
+            continue
+        seen.add(product.id)
+        lines.append(_form_line(product, _item_sku(*in_stock[0]), 0))
+        if len(lines) == MAX_LINES:
+            break
+    if not lines:
+        return None
+
+    # No lines: there is nothing for confirm_draft (a "yes" in the chat) to
+    # place. Only the form's own choices, via confirm_form, can order.
+    draft = _new_draft(session, customer_id, [], Decimal("0.00"), now)
+    return {
+        "kind": "cart",
+        "draft_id": draft.id,
+        "lines": lines,
+        "total": "0.00",
+        "expires_at": draft.expires_at.isoformat(),
+    }
+
+
 def confirm_draft(
     session: Session, customer_id: int, request_started_at: datetime, now: datetime
 ) -> dict:
@@ -231,7 +280,7 @@ def confirm_draft(
         .limit(1)
         .with_for_update()
     )
-    if draft is None:
+    if draft is None or not draft.lines:  # no lines: a cart, which only its form can place
         return {"placed": False, "reason": "There is no order waiting for confirmation. "
                 "Use prepare_order first."}
     if draft.expires_at <= now:

@@ -252,6 +252,7 @@ Argon2id hashing (timing-equal for unknown users); JWT HS256 with required `exp`
 - **`prepare_draft`** resolves SKUs (a base product's SKU preselects an in-stock variant), checks stock, supersedes the customer's previous open draft, saves the quote, and builds the **order form** (each line's variants with name, price, billing period and max quantity).
 - **`confirm_draft`** (typed "yes"): latest open draft, locked; refused if expired, created in the same request, or if the total changed (a savepoint undoes the stock taken).
 - **`confirm_form`** (button click): the customer's chosen SKUs and quantities; must be their own open, unexpired draft; refused (409, nothing saved) if the total differs from `expected_total`. A click is the confirmation, so no earlier-turn rule.
+- **`prepare_cart`** (after a product search by a signed-in customer; called from `chat_service._add_cart`): the same form with `kind: "cart"` — one line per in-stock product found, every quantity 0. Saved as a draft with no lines, so only `confirm_form` can place it; `confirm_draft` treats it as "nothing waiting".
 - **`is_confirmation(message, action)`** — strict English pattern; "no", "wait", "change", "keep"... mean no; "cancel" means no when confirming an order but yes when confirming a cancellation.
 
 ### 5.13 Cancelling by chat (`order_cancellations.py`)
