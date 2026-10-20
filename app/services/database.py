@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Customer, Order, Product, ProductType, Ticket
+from app.services import conversations
 from app.services import variants as variant_rules
 from app.services.catalog import describe_attributes
 from app.services.order_cancellations import confirm_cancellation, request_cancellation
@@ -216,6 +217,24 @@ class Database:
                 stocks = [v["stock_quantity"] for v in row["variants"]] or [row["stock_quantity"]]
                 row["available"] = any(s is None or s > 0 for s in stocks)
             return rows, total
+
+    def load_conversation_history(self, customer_id, conversation_id, turns):
+        """The last `turns` exchanges of the customer's own conversation, or
+        None if there is no such conversation on their account."""
+        with self._session_factory() as session:
+            return conversations.history(session, customer_id, conversation_id, turns)
+
+    def save_conversation_turn(
+        self, customer_id, conversation_id, question, answer, sources, tools_used, now
+    ):
+        """Save one exchange (see conversations.add_turn). Returns the
+        conversation's id, which is new if conversation_id wasn't usable."""
+        with self._session_factory() as session:
+            conversation = conversations.add_turn(
+                session, customer_id, conversation_id, question, answer, sources, tools_used, now
+            )
+            session.commit()
+            return conversation.id
 
     def prepare_order_draft(self, customer_id, lines, now):
         """Quote an order for the customer (see order_drafts.prepare_draft)."""

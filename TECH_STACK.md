@@ -21,7 +21,7 @@ for the build history, see [DOCUMENTATION.md](DOCUMENTATION.md).
 6. [Web chat interface — plain HTML and JavaScript](#6-web-chat-interface--plain-html-and-javascript)
 7. [The language model — Qwen2.5-72B-Instruct](#7-the-language-model--qwen25-72b-instruct)
 8. [LLM access — Hugging Face Inference Providers](#8-llm-access--hugging-face-inference-providers)
-9. [Agent design — tool calling, written by hand](#9-agent-design--tool-calling-written-by-hand)
+9. [Agent design — tool calling with a LangChain agent](#9-agent-design--tool-calling-with-a-langchain-agent)
 10. [Safe write actions — quote, then confirm](#10-safe-write-actions--quote-then-confirm)
 11. [Knowledge retrieval (RAG) — fastembed + bge-small](#11-knowledge-retrieval-rag--fastembed--bge-small)
 12. [Vector search — pgvector](#12-vector-search--pgvector)
@@ -81,7 +81,7 @@ catalog, orders, FAQ vectors — lives in one PostgreSQL database.
 | Web UI | One HTML file, plain JavaScript | Chat page + order form | React/Vue/Next.js |
 | LLM | `Qwen/Qwen2.5-72B-Instruct` on `deepinfra` | Understands questions, picks tools, writes answers | `microsoft/phi-4`, Llama-3.1-8B, GPT/Claude APIs |
 | LLM access | Hugging Face Inference Providers (`huggingface_hub`) + multi-token failover | Hosted model API | OpenAI API, self-hosting (vLLM/Ollama), Groq |
-| Agent | Hand-written tool-calling loop | Lets the model fetch live data and act safely | LangChain/LlamaIndex, prompt stuffing, LLM-written SQL |
+| Agent | LangChain `create_agent` (LangGraph) with our tools, guards as middleware | Lets the model fetch live data and act safely | Hand-written loop (the earlier design), LlamaIndex, prompt stuffing, LLM-written SQL |
 | Embeddings | `BAAI/bge-small-en-v1.5` via `fastembed` | Turns FAQ text and questions into vectors | sentence-transformers, OpenAI embeddings, bge-base |
 | Vector search | `pgvector` (HNSW, cosine) | Finds FAQ sections by meaning | Pinecone, Qdrant, Weaviate, Chroma, FAISS |
 | Database | PostgreSQL 16 | All data; transactions and locks | MySQL, MongoDB, SQLite |
@@ -292,13 +292,30 @@ caused 403s during development).
 
 ---
 
-## 9. Agent design — tool calling, written by hand
+## 9. Agent design — tool calling with a LangChain agent
 
 **Role.** Instead of pasting all data into the prompt, the model is offered
-**tools** (`app/services/tools.py`) and the chat service
-(`chat_service.answer_question`) runs a loop: the model asks for a tool, we
-run it, feed back the result, and repeat (at most 4 rounds, 3 calls per
-round) until it answers.
+**tools** (`app/services/tools.py`). A LangChain agent (`create_agent`, a
+LangGraph graph, built in `app/services/agent.py`) runs the loop: the model
+asks for a tool, the tool runs, the result goes back, and it repeats (at most
+4 rounds, 3 calls per round) until it answers.
+
+**How LangChain is used.**
+- **The loop** is LangChain's agent graph. The limits are agent middleware:
+  `StepLimit` (after 4 tool rounds, one final call with no tools offered) and
+  `ToolCallGuard` (calls beyond 3 per round, and exact repeats, get a result
+  without running; tools the caller wasn't offered get a refusal).
+- **The tools** are LangChain `StructuredTool`s, but each carries our own JSON
+  schema and hands the model's raw arguments to `tools.run_tool`. So
+  validation, the login re-check, error handling and size caps are still our
+  audited code, not LangChain's.
+- **The model** is our `LLMClient` wrapped as a LangChain chat model
+  (`ClientChatModel`), keeping token rotation, provider fallbacks, retries,
+  the 503 mapping, Gemini's `thought_signature` and streaming. LangChain's
+  provider packages (`langchain-openai`, `langchain-google-genai`...) could
+  replace it later.
+- An agent is built per request (about 5 ms), because its tools are bound to
+  that request's authenticated customer.
 
 | Tool | Signed out? | What it does |
 |---|---|---|
@@ -326,7 +343,8 @@ round) until it answers.
 |---|---|
 | Prompt stuffing (the original design: always paste the catalog and the customer's orders into the prompt) | Costly on every question, couldn't apply filters like "under $10", and couldn't take actions. |
 | **Letting the model write SQL** | Rejected outright: anyone who can chat would have a route to the whole database. |
-| LangChain / LlamaIndex | Useful for complex pipelines, but our loop is ~100 lines. Writing it ourselves keeps every security check visible and testable, and avoids a large, fast-changing dependency. |
+| Hand-written loop (used until this change) | About 100 lines and fully transparent, but every new behaviour (routing, multi-agent flows, tracing, retries) had to be built by hand. The LangChain agent keeps the same security checks in our own code while opening those up. The cost is a large, fast-moving dependency (`langchain` 1.x, `langgraph`). |
+| LlamaIndex | Strongest at document retrieval pipelines; our retrieval is a single pgvector query, and LangChain's agent tooling fits the tool-calling core better. |
 
 **Trade-offs.** More tokens per question when tools are used; needs a model
 that calls tools reliably (§7); the model occasionally answers from the FAQ
@@ -594,7 +612,7 @@ rate limiting yet; HTTPS is needed in production.
 
 | Kind | How | Covers |
 |---|---|---|
-| Tool-calling loop | A scripted **fake LLM** | Customer scoping, tool offers, argument validation, retry/failover rules, confirmation checks |
+| Tool-calling agent | A scripted **fake LLM** | Customer scoping, tool offers, argument validation, retry/failover rules, confirmation checks |
 | Pure rules | Plain functions | Attribute and variant validation, "clear yes" detection |
 | WebSocket protocol | FastAPI `TestClient` | Auth, history, reset, errors, bad frames |
 | Database behaviour | **Real Postgres**, each test inside a transaction that's rolled back | Ordering variants, stock, row locks, savepoints, drafts, cancellations, SKU uniqueness |

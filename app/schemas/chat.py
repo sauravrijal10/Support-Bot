@@ -21,8 +21,14 @@ class ChatRequest(BaseModel):
         max_length=20,
         description=(
             "Earlier turns of this conversation, oldest first, so follow-up "
-            "questions have context. Optional; the most recent few are used."
+            "questions have context. Optional; the most recent few are used. "
+            "Ignored when conversation_id is sent."
         ),
+    )
+    conversation_id: int | None = Field(
+        default=None, ge=1,
+        description="Continue this saved conversation (signed in only): its stored "
+        "history is used and this turn is added to it.",
     )
 
 
@@ -76,6 +82,11 @@ class ChatResponse(BaseModel):
         description="Present when the assistant prepared an order to confirm, or showed "
         "products a signed-in customer can order.",
     )
+    conversation_id: int | None = Field(
+        default=None,
+        description="The saved conversation this turn was added to (signed in only). Send "
+        "it back to continue the conversation.",
+    )
 
 
 # ------------------------------------------------ WebSocket frames (client -> server)
@@ -83,10 +94,14 @@ class ChatResponse(BaseModel):
 
 class WSAuth(BaseModel):
     """Sign in (or, with token=None, sign out) on an open connection.
-    Changing identity starts a fresh conversation."""
+    Changing identity starts a fresh conversation, unless conversation_id
+    names one of the customer's saved conversations to resume."""
 
     type: Literal["auth"]
     token: str | None = None
+    conversation_id: int | None = Field(
+        default=None, ge=1, description="Resume this saved conversation of the customer's."
+    )
 
 
 class WSMessage(BaseModel):

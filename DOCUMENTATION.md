@@ -80,7 +80,7 @@ The model never touches the database and never writes SQL. Every tool runs a fix
 │ 1. signed out + account-type question?  -> "please log in" (no model call)   │
 │ 2. retrieve top-3 FAQ chunks from pgvector (previous question included)      │
 │ 3. messages = system(rules + who + FAQ) + last 6 turns + question            │
-│ 4. tool-calling loop (<= 4 rounds, <= 3 calls per round):                    │
+│ 4. LangChain agent (<= 4 rounds, <= 3 calls per round):                      │
 │      llm.complete(messages, tools_for(customer))                             │
 │        tool call?  -> run_tool(name, args, ctx) -> append result -> repeat   │
 │                      ctx.customer = the AUTHENTICATED customer               │
@@ -147,7 +147,8 @@ support-bot/
 │   │   ├── database.py            # dict-returning helpers for tools and login
 │   │   ├── llm.py                 # HF client: retry, multi-token failover, 503 on failure
 │   │   ├── tools.py               # the 9 tools + their security model
-│   │   ├── chat_service.py        # FAQ -> tool-calling loop -> answer (+ order form)
+│   │   ├── chat_service.py        # FAQ -> LangChain agent -> answer (+ order form)
+│   │   ├── agent.py               # the LangChain agent: model adapter, tools, guard middleware
 │   │   ├── customer_lookup.py     # signed-out gate (spots account-type questions)
 │   │   └── vector_knowledge_base.py  embeddings.py  document_loader.py  errors.py
 │   └── web/index.html             # browser chat page + order form
@@ -230,7 +231,7 @@ FastAPI has no class-based views, so `base.py` provides a small `APIView` + `@ro
 1. **Login gate** — signed out + account-type question (regex) → login prompt, no model call.
 2. **FAQ retrieval** — top 3 chunks; for follow-ups the previous question is searched too.
 3. **Messages** — system message (rules, who is signed in, FAQ text), then up to 6 earlier turns, then the question alone. (Keeping the FAQ out of the latest user message was needed for follow-ups to resolve against the conversation.)
-4. **Loop** — ≤ 4 rounds, ≤ 3 calls per round, exact repeats short-circuited; at the cap, one final tools-off call.
+4. **Agent** — `agent.run_agent`: a LangChain `create_agent` graph with our tools as `StructuredTool`s (executed through `tools.run_tool`) and our `LLMClient` wrapped as a LangChain chat model (`ClientChatModel`). Middleware keeps the limits: `StepLimit` (≤ 4 tool rounds, then one final tools-off call with a nudge) and `ToolCallGuard` (≤ 3 calls per round, exact repeats short-circuited, unoffered tools refused). `tools_used` is worked out from the final messages.
 5. **Result** — `answer`, `sources`, `needs_authentication`, `tools_used`, `order_form`. If a form is attached and the model's reply is near-empty, a standard sentence pointing at the form is used.
 
 The system prompt includes a worked example so the model shows the order form straight away instead of first asking "which size?".
@@ -257,6 +258,11 @@ Argon2id hashing (timing-equal for unknown users); JWT HS256 with required `exp`
 
 ### 5.13 Cancelling by chat (`order_cancellations.py`)
 `request_cancellation` (own order, still pending; explains processing/completed/cancelled cases) and `confirm_cancellation` (latest open request, locked; earlier turn, not expired; `transition_order` — refused if the order moved on meanwhile). Orders are always looked up by the authenticated customer's id, so even admins can only cancel their own orders through the bot.
+
+### 5.13a Saved conversations (`conversations.py`, `views/conversations.py`)
+- Tables `conversations` (owner, title = first question, created/updated) and `conversation_messages` (question, answer, sources, tools used), migration `0007`. Signed-in customers only.
+- `chat_service.save_turn` saves each exchange after the answer (REST and WebSocket); a save failure is logged and the answer still goes out. `history()` returns the last 6 turns for the model, `None` if the conversation isn't the caller's; `add_turn` never appends to someone else's conversation (it starts a new one).
+- `POST /chat` takes and returns `conversation_id`; the WebSocket `auth` frame takes it to resume, and `auth_ok` / `answer` frames return it. `GET/DELETE /conversations[/{id}]` are owner-only, admins included.
 
 ### 5.14 WebSocket chat (`routes/chat_ws.py`)
 Per-connection `Conversation`: token, customer, history (≤ 6 turns). Frames are validated with a discriminated pydantic union; oversized, binary or invalid frames get an `invalid_frame` error and the socket stays open. The token is re-checked before each question; an expired token produces `unauthorized` and a sign-out, never an anonymous answer. Changing identity clears the history. Blocking work runs in the thread pool.

@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.api.deps import get_optional_customer
 from app.schemas.chat import ChatRequest, ChatResponse
-from app.services.chat_service import answer_question
+from app.services.chat_service import MAX_HISTORY_TURNS, answer_question, save_turn
+from app.services.errors import NotFoundError
 
 router = APIRouter(tags=["chat"])
 
@@ -15,16 +16,32 @@ def ask(
 ) -> ChatResponse:
     """Answer a question. Send `Authorization: Bearer <token>` to get
     answers about your own account, orders and tickets; without it only
-    general FAQ questions are answered. Pass earlier turns in `history`
-    for follow-up questions (this endpoint keeps no state; for a stateful
-    conversation use the WebSocket at /ws/chat)."""
+    general FAQ questions are answered.
+
+    Signed in, every exchange is saved: the response's `conversation_id`,
+    sent back with the next question, continues that conversation with its
+    stored history. Signed out, nothing is saved -- pass earlier turns in
+    `history` for follow-up questions (or use the WebSocket at /ws/chat)."""
+    db = request.app.state.db
+    history = [turn.model_dump() for turn in payload.history]
+    conversation_id = payload.conversation_id
+    if conversation_id is not None:
+        if customer is None:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "Sign in to continue a saved conversation",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        history = db.load_conversation_history(customer["id"], conversation_id, MAX_HISTORY_TURNS)
+        if history is None:
+            raise NotFoundError("Conversation not found")
+
     result = answer_question(
         llm=request.app.state.llm,
         kb=request.app.state.kb,
-        db=request.app.state.db,
+        db=db,
         query=payload.question,
         customer=customer,
-        history=[turn.model_dump() for turn in payload.history],
+        history=history,
     )
     return ChatResponse(
         answer=result.answer,
@@ -32,4 +49,5 @@ def ask(
         needs_authentication=result.needs_authentication,
         tools_used=result.tools_used,
         order_form=result.order_form,
+        conversation_id=save_turn(db, customer, conversation_id, payload.question, result),
     )

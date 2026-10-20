@@ -223,6 +223,17 @@ def test_numeric_strings_and_missing_or_dict_arguments_are_accepted():
     assert all("error" not in r for r in results)
 
 
+@pytest.mark.parametrize("raw", ['{"order_id": 8', "[8]", '"8"'])
+def test_malformed_arguments_become_an_error_result_and_run_nothing(raw):
+    llm = FakeLLM(reply(calls=[tool_call("get_order", raw)]), reply("Which order?"))
+    result, db = ask(llm)
+    assert result.answer == "Which order?" and db.order_lookups == []
+    assert "Invalid arguments" in json.loads(llm.requests[1][0][-1]["content"])["error"]
+    # The call goes back to the provider exactly as the model wrote it.
+    sent_back = next(m for m in llm.requests[1][0] if m["role"] == "assistant")["tool_calls"][0]
+    assert sent_back["function"]["arguments"] == raw
+
+
 def test_a_failing_tool_is_reported_to_the_model_without_leaking_details():
     db = FakeDB()
     db.fail = True

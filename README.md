@@ -32,7 +32,8 @@ support-bot/
 │   │       ├── product_types.py # ProductTypeView (categories + their attribute definitions)
 │   │       ├── products.py      # ProductView
 │   │       ├── orders.py        # OrderView
-│   │       └── tickets.py       # TicketView
+│   │       ├── tickets.py       # TicketView
+│   │       └── conversations.py # ConversationView (saved chats)
 │   ├── web/index.html           # chat UI (plain HTML/JS; talks to the API over REST or WebSocket)
 │   ├── schemas/                 # pydantic request/response models (auth, chat, product, order, ticket)
 │   └── services/
@@ -47,7 +48,9 @@ support-bot/
 │       ├── tools.py                 # TOOL CALLING: schemas + handlers the model may invoke
 │       ├── catalog.py               # product attributes checked against their type's definition
 │       ├── customer_lookup.py       # signed-out gate only (spots account-type questions)
-│       └── chat_service.py          # retrieve FAQ -> tool-calling loop -> answer
+│       ├── conversations.py         # saved chats: history to replay, saving each exchange
+│       ├── agent.py                 # LangChain agent: our LLM client as a chat model, tools, guard middleware
+│       └── chat_service.py          # retrieve FAQ -> LangChain agent -> answer
 ├── knowledge/
 │   └── faq.md                   # sample company FAQ — replace with your own docs
 ├── migrations/                  # Alembic migrations (source of truth for the schema)
@@ -250,11 +253,16 @@ quietly treated as "signed out").
 
 ### Chat
 
-**`POST /chat`** -- JSON `{"question": "...", "history": [...]}`. Stateless:
-`history` (optional) is the earlier turns, oldest first, as
+**`POST /chat`** -- JSON `{"question": "...", "history": [...]}`. Signed out
+it is stateless: `history` (optional) is the earlier turns, oldest first, as
 `{"question", "answer"}` objects; the most recent 6 are given to the model so
 follow-ups like "how much is it?" work. Returns `answer`, `sources`,
-`tools_used` and `needs_authentication`.
+`tools_used`, `needs_authentication` and `conversation_id`.
+
+Signed in, every exchange is **saved**: the response's `conversation_id`, sent
+back as `"conversation_id"` with the next question, continues that
+conversation with its stored history (`history` is then ignored). Someone
+else's id is `404`; a `conversation_id` without a login is `401`.
 
 **`WS /ws/chat`** -- one connection is one conversation; the server keeps the
 history. JSON text frames:
@@ -262,9 +270,9 @@ history. JSON text frames:
 | Client sends | Server replies |
 |---|---|
 | *(on connect)* | `{"type": "ready", "customer": null}` |
-| `{"type": "auth", "token": "<access_token>"}` (`null` signs out) | `{"type": "auth_ok", "customer": {...}}` or an `unauthorized` error |
+| `{"type": "auth", "token": "<access_token>", "conversation_id": 12}` (`token: null` signs out; `conversation_id` optional) | `{"type": "auth_ok", "customer": {...}, "conversation_id": 12}` or an `unauthorized` error. `conversation_id` is the saved conversation being continued, `null` if a new one starts (also when the id isn't the customer's) |
 | `{"type": "message", "question": "..."}` | `{"type": "typing"}`, then `{"type": "delta", "text": "..."}` frames as the answer is written, then `{"type": "answer", ...}` (same fields as `POST /chat`) with the full answer, which replaces the deltas. A second `typing` means the deltas so far should be dropped |
-| `{"type": "reset"}` | `{"type": "reset_ok"}` -- history forgotten |
+| `{"type": "reset"}` | `{"type": "reset_ok"}` -- history forgotten; the next message starts a new saved conversation |
 | `{"type": "ping"}` | `{"type": "pong"}` |
 
 Errors arrive as `{"type": "error", "code", "detail"}` with `code` one of
@@ -273,6 +281,26 @@ connection stays open. The token is sent in a frame (not the URL, so it stays
 out of access logs) and re-checked before every question: once it expires
 you get `unauthorized` and are signed out, never silently answered as
 anonymous. Signing in as someone else clears the history.
+
+### Saved conversations
+
+A signed-in customer's chats are stored (tables `conversations` and
+`conversation_messages`), so they survive a page refresh, a dropped
+WebSocket, a server restart, or a switch to another device. Each `answer`
+frame and `POST /chat` response carries the `conversation_id`; a client
+continues by sending it with `auth` (WebSocket) or the next question (REST).
+The chat page reopens the latest conversation if it was active in the last
+24 hours; **New chat** starts another. Anonymous chats are not saved.
+
+| Endpoint | Does |
+|---|---|
+| `GET /conversations` | Your conversations, most recently active first (`?limit=`, `?offset=`) |
+| `GET /conversations/{id}` | One with every exchange: question, answer, sources, tools used |
+| `DELETE /conversations/{id}` | Delete it and everything said in it |
+
+Conversations are private: everyone, admins included, sees only their own,
+and someone else's id is `404`. Every exchange is kept (only the last 6 are
+replayed to the model); there is no automatic expiry yet.
 
 ```
 # quick try with websocat (https://github.com/vi/websocat)
@@ -613,9 +641,15 @@ system prompt also tells the model to decline questions about other
 accounts, but the real protection is that the tool would refuse (or the tool
 isn't even offered to a signed-out caller) regardless of what the model asks.
 
+The loop is a **LangChain agent** (`create_agent`, built per request in
+`app/services/agent.py`). The limits shown above are agent middleware
+(`StepLimit`, `ToolCallGuard`), the tools are LangChain tools that execute
+through `run_tool`, and the model is our `LLMClient` wrapped as a LangChain
+chat model, so provider fallbacks and streaming behave as before.
+
 This is a real (if simple) agentic RAG pipeline: the model decides what it
-needs and asks for it through a fixed, read-only set of tools -- it never
-touches the database or writes SQL. Because tools query Postgres live,
+needs and asks for it through a fixed set of tools -- it never touches the
+database or writes SQL. Because tools query Postgres live,
 editing a product or placing an order through the API changes the bot's very
 next answer.
 

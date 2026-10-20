@@ -136,6 +136,7 @@
     "What have I ordered?",
   ];
   const MAX_HISTORY = 6; // turns sent with each REST call (server caps it too)
+  const RESUME_HOURS = 24; // reopen the latest saved conversation if it is this recent
 
   const $ = (id) => document.getElementById(id);
   const log = $("log"), questionEl = $("question"), sendBtn = $("send");
@@ -151,7 +152,8 @@
     mode: store.get("mode") === "rest" ? "rest" : "ws",
     token: store.get("token"),
     customer: null,
-    history: [],      // REST mode only; the WebSocket server keeps its own
+    history: [],      // REST mode, signed out only; otherwise the server keeps it
+    conversationId: null, // the saved conversation (signed in only)
     busy: false,
     ws: null,
     wsReady: false,
@@ -338,6 +340,32 @@
     return card;
   }
 
+  // ------------------------------------------------------------- saved conversations
+
+  // Reopen the signed-in customer's latest conversation, if recent: show its
+  // messages and continue it (sent with auth / each REST question).
+  async function resumeLatest() {
+    try {
+      const [latest] = await api("/conversations?limit=1");
+      if (!latest || Date.now() - Date.parse(latest.updated_at) > RESUME_HOURS * 3600 * 1000) return false;
+      const conversation = await api(`/conversations/${latest.id}`);
+      log.replaceChildren();
+      for (const m of conversation.messages) {
+        addUser(m.question);
+        addBot({ answer: m.answer, sources: m.sources, tools_used: m.tools_used });
+      }
+      state.conversationId = conversation.id;
+      state.history = conversation.messages.map((m) => ({ question: m.question, answer: m.answer }));
+      return true;
+    } catch {
+      return false; // starting fresh is fine
+    }
+  }
+
+  function noteConversation(data) {
+    if (data.conversation_id != null) state.conversationId = data.conversation_id;
+  }
+
   function addSystem(text, isError) {
     clearEmpty();
     log.append(el("div", "system" + (isError ? " error" : ""), text));
@@ -478,9 +506,10 @@
     state.customer = customer;
     store.set("token", token);
     startNewChat(false);
+    const resumed = await resumeLatest();
     renderAccount();
-    if (state.mode === "ws") wsSend({ type: "auth", token });
-    addSystem(`Signed in as ${customer.name}. New conversation started.`);
+    if (state.mode === "ws") wsSend({ type: "auth", token, conversation_id: state.conversationId });
+    addSystem(`Signed in as ${customer.name}. ` + (resumed ? "Continuing your last conversation." : "New conversation started."));
   }
 
   function signOut(reason) {
@@ -498,12 +527,19 @@
       const data = await api("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, history: state.history.slice(-MAX_HISTORY) }),
+        body: JSON.stringify({
+          question, history: state.history.slice(-MAX_HISTORY), conversation_id: state.conversationId,
+        }),
       });
       state.history.push({ question, answer: data.answer });
+      noteConversation(data);
       addBot(data);
     } catch (err) {
       if (err.status === 401) signOut("Your session expired. Please sign in again.");
+      else if (err.status === 404 && state.conversationId) {
+        state.conversationId = null; state.history = [];
+        addSystem("That conversation no longer exists, so a new one was started. Please ask again.", true);
+      }
       else addSystem(err.message, true);
     } finally {
       setBusy(false);
@@ -536,11 +572,17 @@
       switch (frame.type) {
         case "ready":
           // A fresh connection is anonymous with no history: re-identify.
-          if (state.token) wsSend({ type: "auth", token: state.token });
+          // With conversation_id the server reloads the saved conversation,
+          // so a dropped connection doesn't lose the history.
+          if (state.token) wsSend({ type: "auth", token: state.token, conversation_id: state.conversationId });
           state.wsReady = true;
           setStatus("ok", "Connected");
           break;
         case "auth_ok":
+          if (frame.customer && state.conversationId && frame.conversation_id !== state.conversationId) {
+            state.conversationId = null;
+            addSystem("Your previous conversation couldn't be reopened, so a new one was started.");
+          }
           break;
         case "typing":
           clearDelta();
@@ -552,6 +594,7 @@
         case "answer":
           clearDelta();
           setBusy(false);
+          noteConversation(frame);
           addBot(frame);
           break;
         case "error":
@@ -596,6 +639,7 @@
 
   function startNewChat(notify = true) {
     state.history = [];
+    state.conversationId = null; // the old one stays saved; the next message starts a new one
     if (state.mode === "ws") wsSend({ type: "reset" });
     showEmpty();
     if (notify) questionEl.focus();
@@ -644,6 +688,7 @@
         state.token = null;
         store.set("token", null);
       }
+      if (state.customer && await resumeLatest()) addSystem("Continuing your last conversation.");
     }
     renderAccount();
     if (state.mode === "ws") wsConnect();

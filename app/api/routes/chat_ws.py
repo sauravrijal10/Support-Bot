@@ -8,7 +8,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.deps import customer_from_token
 from app.schemas.auth import CustomerProfile
 from app.schemas.chat import ChatResponse, WSAuth, WSClientFrame, WSMessage, WSPing, WSReset
-from app.services.chat_service import MAX_HISTORY_TURNS, answer_question
+from app.services.chat_service import MAX_HISTORY_TURNS, answer_question, save_turn
 from app.services.errors import DomainError
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,9 @@ def _profile(customer: dict | None) -> dict | None:
 
 
 class Conversation:
-    """Per-connection state: who is signed in and what was said so far."""
+    """Per-connection state: who is signed in and what was said so far.
+    A signed-in customer's exchanges are also saved (conversation_id), so a
+    reconnecting client can resume them by sending that id with `auth`."""
 
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
@@ -34,6 +36,7 @@ class Conversation:
         self.token: str | None = None
         self.customer: dict | None = None
         self.history: list[dict] = []
+        self.conversation_id: int | None = None  # saved conversation (signed in only)
 
     async def send(self, type_: str, **data) -> None:
         await self.ws.send_json({"type": type_, **data})
@@ -43,13 +46,13 @@ class Conversation:
 
     def _set_identity(self, token: str | None, customer: dict | None) -> None:
         if (customer or {}).get("id") != (self.customer or {}).get("id"):
-            self.history = []
+            self.history, self.conversation_id = [], None
         self.token, self.customer = token, customer
 
     async def on_auth(self, frame: WSAuth) -> None:
         if frame.token is None:
             self._set_identity(None, None)
-            await self.send("auth_ok", customer=None)
+            await self.send("auth_ok", customer=None, conversation_id=None)
             return
 
         customer = await run_in_threadpool(customer_from_token, self.state.db, frame.token)
@@ -57,7 +60,18 @@ class Conversation:
             await self.error("unauthorized", INVALID_TOKEN)
             return
         self._set_identity(frame.token, customer)
-        await self.send("auth_ok", customer=_profile(customer))
+        if frame.conversation_id is not None:
+            # Only the customer's own conversation loads; anything else
+            # (someone else's, deleted) starts fresh -- auth_ok says which.
+            history = await run_in_threadpool(
+                self.state.db.load_conversation_history,
+                customer["id"], frame.conversation_id, MAX_HISTORY_TURNS,
+            )
+            self.history = history or []
+            self.conversation_id = frame.conversation_id if history is not None else None
+        await self.send(
+            "auth_ok", customer=_profile(customer), conversation_id=self.conversation_id
+        )
 
     async def on_message(self, frame: WSMessage) -> None:
         if self.token is not None:
@@ -66,7 +80,7 @@ class Conversation:
                 # Never silently answer as anonymous: say so and sign out.
                 self._set_identity(None, None)
                 await self.error("unauthorized", INVALID_TOKEN)
-                await self.send("auth_ok", customer=None)
+                await self.send("auth_ok", customer=None, conversation_id=None)
                 return
             self.customer = customer
 
@@ -96,6 +110,9 @@ class Conversation:
 
         self.history.append({"question": frame.question, "answer": result.answer})
         del self.history[:-MAX_HISTORY_TURNS]
+        self.conversation_id = await run_in_threadpool(
+            save_turn, self.state.db, self.customer, self.conversation_id, frame.question, result
+        )
 
         response = ChatResponse(
             answer=result.answer,
@@ -103,6 +120,7 @@ class Conversation:
             needs_authentication=result.needs_authentication,
             tools_used=result.tools_used,
             order_form=result.order_form,
+            conversation_id=self.conversation_id,
         )
         await self.send("answer", **response.model_dump())
 
@@ -123,7 +141,8 @@ class Conversation:
         elif isinstance(frame, WSMessage):
             await self.on_message(frame)
         elif isinstance(frame, WSReset):
-            self.history = []
+            # The saved conversation stays; the next message starts a new one.
+            self.history, self.conversation_id = [], None
             await self.send("reset_ok")
         elif isinstance(frame, WSPing):
             await self.send("pong")
