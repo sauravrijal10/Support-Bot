@@ -38,23 +38,26 @@ def verify_password(password: str, password_hash: str | None) -> bool:
         return False
 
 
-def create_access_token(customer_id: int) -> tuple[str, int]:
-    """Returns (token, lifetime_in_seconds)."""
+def create_access_token(customer_id: int, session_id: int) -> tuple[str, int]:
+    """Returns (token, lifetime_in_seconds). Short-lived: the session's
+    refresh token renews it (app/services/sessions.py). `sid` names the
+    session, so revoking the session invalidates the token at once."""
     settings = get_settings()
     now = datetime.now(timezone.utc)
     lifetime = timedelta(minutes=settings.jwt_expire_minutes)
-    payload = {"sub": str(customer_id), "iat": now, "exp": now + lifetime}
+    payload = {"sub": str(customer_id), "sid": str(session_id), "iat": now, "exp": now + lifetime}
     token = jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
     return token, int(lifetime.total_seconds())
 
 
-def decode_access_token(token: str) -> int:
-    """Returns the customer id. Raises jwt.InvalidTokenError (covers
-    expired, tampered and malformed tokens) or ValueError."""
+def decode_access_token(token: str) -> tuple[int, int]:
+    """Returns (customer_id, session_id). Raises jwt.InvalidTokenError
+    (covers expired, tampered and malformed tokens, and older tokens with no
+    session) or ValueError."""
     payload = jwt.decode(
         token,
         get_settings().jwt_secret,
         algorithms=[ALGORITHM],
-        options={"require": ["exp", "sub"]},
+        options={"require": ["exp", "sub", "sid"]},
     )
-    return int(payload["sub"])
+    return int(payload["sub"]), int(payload["sid"])

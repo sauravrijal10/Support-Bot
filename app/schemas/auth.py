@@ -36,4 +36,19 @@ class CustomerProfile(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    expires_in: int = Field(..., description="Token lifetime in seconds")
+    expires_in: int = Field(..., description="Access token lifetime in seconds (short)")
+    refresh_token: str = Field(
+        ...,
+        description="Exchange at POST /auth/refresh for a new access token. Single use: each "
+        "refresh returns a new one. Browsers also get it as an HttpOnly cookie.",
+    )
+    refresh_expires_in: int = Field(..., description="Refresh token lifetime in seconds")
+
+
+class RefreshRequest(BaseModel):
+    """Optional body for /auth/refresh and /auth/logout. Browsers can send
+    nothing: the HttpOnly refresh cookie is used instead."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: str | None = Field(default=None, min_length=1, max_length=200)

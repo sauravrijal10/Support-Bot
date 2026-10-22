@@ -6,6 +6,8 @@ customer. These are plain `def` (not async) so the blocking DB call runs
 in FastAPI's threadpool instead of stalling the event loop.
 """
 
+from datetime import datetime, timezone
+
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
@@ -26,14 +28,15 @@ def _unauthorized(detail: str) -> HTTPException:
 
 
 def customer_from_token(db, token: str) -> dict | None:
-    """The customer a token belongs to, or None if the token is invalid,
-    expired, or names a customer that no longer exists. Blocking (DB call).
-    Shared by the HTTP dependencies and the WebSocket chat."""
+    """The customer an access token belongs to, or None if the token is
+    invalid or expired, or its sign-in session was revoked (signed out) or
+    has ended. Blocking (DB call). Shared by the HTTP dependencies and the
+    WebSocket chat, which re-checks before every question."""
     try:
-        customer_id = decode_access_token(token)
+        customer_id, session_id = decode_access_token(token)
     except (jwt.InvalidTokenError, ValueError):
         return None
-    return db.get_customer_by_id(customer_id)
+    return db.get_session_customer(customer_id, session_id, datetime.now(timezone.utc))
 
 
 def get_optional_customer(

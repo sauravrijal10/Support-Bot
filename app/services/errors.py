@@ -22,6 +22,13 @@ class InvalidRequestError(DomainError):
     status_code = 422
 
 
+class UnauthorizedError(DomainError):
+    """Not signed in, or the credentials are no longer valid."""
+
+    status_code = 401
+    headers = {"WWW-Authenticate": "Bearer"}
+
+
 class ServiceUnavailableError(DomainError):
     """An upstream dependency (e.g. the LLM provider) is failing or busy."""
 

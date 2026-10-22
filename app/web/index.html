@@ -159,6 +159,8 @@
     wsReady: false,
     retry: 0,
     retryTimer: null,
+    pending: null,      // WebSocket question awaiting its answer (resent after a token refresh)
+    wsRenewed: false,   // already refreshed once for the pending question
   };
 
   // ------------------------------------------------------------- rendering
@@ -465,12 +467,70 @@
     box.append(form);
   }
 
+  // ------------------------------------------------------------- tokens
+
+  // The access token is short-lived (minutes). The refresh token that renews
+  // it is an HttpOnly cookie this page never sees; POST /auth/refresh uses it
+  // and returns a new access token (and rotates the cookie).
+  let refreshing = null, refreshTimer = null;
+
+  function tokenExpiry(token) {
+    try {
+      const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      return JSON.parse(atob(part)).exp * 1000;
+    } catch { return 0; }
+  }
+
+  function setToken(token) {
+    state.token = token;
+    store.set("token", token);
+    clearTimeout(refreshTimer);
+    if (!token) return;
+    // Renew a minute before it expires, so requests rarely meet an expired token.
+    const wait = Math.max(5000, tokenExpiry(token) - Date.now() - 60000);
+    refreshTimer = setTimeout(async () => {
+      if (!(await refreshAccessToken())) signOut("Your session expired. Please sign in again.");
+    }, wait);
+  }
+
+  // One refresh at a time: each refresh token works once, so two at once would clash.
+  function refreshAccessToken() {
+    if (!refreshing) {
+      refreshing = (async () => {
+        try {
+          let res = await fetch("/auth/refresh", { method: "POST" });
+          if (res.status === 401) {
+            // Another tab may have just rotated the cookie: try once more with the new one.
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            res = await fetch("/auth/refresh", { method: "POST" });
+          }
+          if (!res.ok) return false;
+          setToken((await res.json()).access_token);
+          if (state.mode === "ws" && state.customer) {
+            wsSend({ type: "auth", token: state.token, conversation_id: state.conversationId });
+          }
+          return true;
+        } catch {
+          return false;
+        } finally {
+          refreshing = null;
+        }
+      })();
+    }
+    return refreshing;
+  }
+
   // ------------------------------------------------------------- HTTP API
 
   async function api(path, options = {}) {
     const headers = { ...(options.headers || {}) };
     if (state.token && options.auth !== false) headers.Authorization = "Bearer " + state.token;
     const res = await fetch(path, { ...options, headers });
+    // An expired access token: renew it and try once more.
+    if (res.status === 401 && state.token && options.auth !== false && !options.retried
+        && await refreshAccessToken()) {
+      return api(path, { ...options, retried: true });
+    }
     let body = null;
     try { body = await res.json(); } catch {}
     if (!res.ok) {
@@ -501,10 +561,9 @@
   }
 
   async function adoptToken(token) {
-    state.token = token;
+    setToken(token);
     const customer = await api("/auth/me");
     state.customer = customer;
-    store.set("token", token);
     startNewChat(false);
     const resumed = await resumeLatest();
     renderAccount();
@@ -514,8 +573,10 @@
 
   function signOut(reason) {
     const wasSignedIn = !!state.customer;
-    state.token = null; state.customer = null;
-    store.set("token", null);
+    // Revoke the session on the server too (the refresh cookie identifies it).
+    if (state.token) fetch("/auth/logout", { method: "POST" }).catch(() => {});
+    setToken(null);
+    state.customer = null;
     startNewChat(false);
     renderAccount();
     if (state.mode === "ws") wsSend({ type: "auth", token: null });
@@ -594,12 +655,24 @@
         case "answer":
           clearDelta();
           setBusy(false);
+          state.pending = null; state.wsRenewed = false;
           noteConversation(frame);
           addBot(frame);
           break;
         case "error":
           clearDelta();
+          if (frame.code === "unauthorized" && state.customer && !state.wsRenewed) {
+            // The access token expired: renew it, sign the socket in again, resend.
+            state.wsRenewed = true;
+            refreshAccessToken().then((ok) => {
+              if (!ok) { setBusy(false); signOut("Your session expired. Please sign in again."); return; }
+              if (state.pending) wsSend({ type: "message", question: state.pending });
+              else setBusy(false);
+            });
+            break;
+          }
           setBusy(false);
+          state.pending = null;
           if (frame.code === "unauthorized") signOut("Your session expired. Please sign in again.");
           else addSystem(frame.detail || "Something went wrong.", true);
           break;
@@ -633,6 +706,7 @@
     if (state.mode === "ws" && !state.wsReady) return;
     addUser(question);
     setBusy(true);
+    state.pending = question; state.wsRenewed = false;
     if (state.mode === "ws") wsSend({ type: "message", question });
     else askRest(question);
   }
@@ -681,12 +755,14 @@
   async function init() {
     renderModeButtons();
     showEmpty();
-    if (state.token) {
+    // No access token (e.g. the tab was closed)? The refresh cookie may still
+    // sign you back in.
+    if (state.token || await refreshAccessToken()) {
       try {
         state.customer = await api("/auth/me");
+        setToken(state.token);
       } catch {
-        state.token = null;
-        store.set("token", null);
+        setToken(null);
       }
       if (state.customer && await resumeLatest()) addSystem("Continuing your last conversation.");
     }

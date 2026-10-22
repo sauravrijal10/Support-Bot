@@ -238,18 +238,39 @@ lower-cased.
 **`POST /auth/login`** -- OAuth2 password flow: form fields `username` (your
 email) and `password`. Returns:
 ```json
-{ "access_token": "<jwt>", "token_type": "bearer", "expires_in": 3600 }
+{ "access_token": "<jwt>", "token_type": "bearer", "expires_in": 900,
+  "refresh_token": "<random>", "refresh_expires_in": 604800 }
 ```
-A wrong password, an unknown email, and an account without a password all
-return the same `401 Incorrect email or password`.
+It also sets the refresh token as a cookie (`refresh_token`: HttpOnly,
+SameSite=Strict, path `/auth`, Secure over HTTPS), which is what the chat page
+uses -- its JavaScript never handles the refresh token. A wrong password, an
+unknown email, and an account without a password all return the same
+`401 Incorrect email or password`.
+
+**`POST /auth/refresh`** -- a new access token **and a new refresh token**, for
+the refresh token in the cookie or in a JSON body `{"refresh_token": "..."}`.
+Each refresh token works **once** (it is rotated). Sending a used one again is
+`401`; if it comes back more than 30 seconds after it was used, it is treated
+as stolen and the whole session is signed out. A session lasts at most 30
+days, however often it is refreshed.
+
+**`POST /auth/logout`** -- signs this session out (cookie or body token);
+always `204`. Its refresh token **and its access tokens** stop working at once.
+
+**`POST /auth/logout-all`** -- with a valid access token: signs out every
+session of yours, on every device.
 
 **`GET /auth/me`** -- returns the signed-in customer's profile (`401` without a
 valid token). Handy for checking a token.
 
 Send the token on later requests as `Authorization: Bearer <access_token>`.
-Tokens expire after `JWT_EXPIRE_MINUTES` (default 60); a missing, expired,
-tampered, or otherwise invalid token gets `401` (an invalid token is never
-quietly treated as "signed out").
+Access tokens are short-lived: they expire after `JWT_EXPIRE_MINUTES` (default
+**15**), and the refresh token (valid `REFRESH_TOKEN_DAYS`, default 7) renews
+them. Each access token names its sign-in session, which is checked on every
+request, so signing out invalidates it immediately. A missing, expired,
+tampered, signed-out or otherwise invalid token gets `401` (an invalid token
+is never quietly treated as "signed out"). The chat page renews the access
+token in the background and signs you back in from the cookie on a new visit.
 
 ### Chat
 

@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Customer, Order, Product, ProductType, Ticket
-from app.services import conversations
+from app.services import conversations, sessions
 from app.services import variants as variant_rules
 from app.services.catalog import describe_attributes
 from app.services.order_cancellations import confirm_cancellation, request_cancellation
@@ -58,6 +58,15 @@ class Database:
                 .where(Customer.id == customer_id)
             ).mappings().first()
             return dict(row) if row else None
+
+    def get_session_customer(self, customer_id, session_id, now):
+        """Public profile, if `session_id` is the customer's own live sign-in
+        session (see sessions.active_customer) -- else None."""
+        with self._session_factory() as session:
+            c = sessions.active_customer(session, customer_id, session_id, now)
+            if c is None:
+                return None
+            return {"id": c.id, "name": c.name, "email": c.email, "plan": c.plan, "is_admin": c.is_admin}
 
     def get_customer_auth_record(self, email):
         """Includes password_hash. Only for the login flow."""

@@ -44,7 +44,9 @@ class Settings:
     hf_tokens: tuple[str, ...]
     database_url: str
     jwt_secret: str
-    jwt_expire_minutes: int = 60
+    # Short-lived on purpose: the refresh token (refresh_token_days) renews it.
+    jwt_expire_minutes: int = 15
+    refresh_token_days: int = 7
     knowledge_dir: str = "knowledge"
     # Must be a model whose provider supports tool calling (phi-4 does not).
     # Pinned provider: "auto" may route to one that doesn't advertise tools.
@@ -95,7 +97,8 @@ def get_settings() -> Settings:
         hf_tokens=hf_tokens,
         database_url=database_url,
         jwt_secret=jwt_secret,
-        jwt_expire_minutes=int(os.environ.get("JWT_EXPIRE_MINUTES", "60")),
+        jwt_expire_minutes=int(os.environ.get("JWT_EXPIRE_MINUTES", "15")),
+        refresh_token_days=int(os.environ.get("REFRESH_TOKEN_DAYS", "7")),
         llm_model=os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct"),
         llm_provider=os.environ.get("LLM_PROVIDER", "deepinfra"),
         llm_fallbacks=llm_fallbacks,
