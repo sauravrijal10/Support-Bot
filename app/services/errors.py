@@ -29,6 +29,17 @@ class UnauthorizedError(DomainError):
     headers = {"WWW-Authenticate": "Bearer"}
 
 
+class TooManyRequestsError(DomainError):
+    """A rate limit was reached (app/services/rate_limit.py)."""
+
+    status_code = 429
+
+    def __init__(self, detail: str, retry_after: int):
+        super().__init__(detail)
+        self.retry_after = retry_after
+        self.headers = {"Retry-After": str(retry_after)}
+
+
 class ServiceUnavailableError(DomainError):
     """An upstream dependency (e.g. the LLM provider) is failing or busy."""
 

@@ -1,0 +1,30 @@
+# Render Blueprint: the API as a Docker web service plus a Postgres database.
+# New -> Blueprint in the Render dashboard, pick this repo. Secrets marked
+# `sync: false` are asked for in the dashboard and never stored here.
+services:
+  - type: web
+    name: support-bot
+    runtime: docker
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: support-bot-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true          # a fresh random secret for production
+      - key: HF_TOKEN
+        sync: false                  # required by the app, even if out of credit
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TRUST_PROXY
+        value: "true"                # rate limits read the client IP Render appends
+      - key: ENABLE_DOCS
+        value: "false"               # no public Swagger UI
+
+databases:
+  - name: support-bot-db

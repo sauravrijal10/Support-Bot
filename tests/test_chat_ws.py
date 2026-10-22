@@ -370,3 +370,45 @@ def test_rest_continuing_a_conversation_needs_a_login(rest):
     assert post(rest, "Hello", conversation_id=1).status_code == 401
     anonymous = post(rest, "Hello").json()
     assert anonymous["conversation_id"] is None and rest.db.saved == {}
+
+
+# ---------------------------------------------------------------- rate limits
+
+
+def test_rest_chat_is_rate_limited_per_customer(rest):
+    for i in range(10):
+        assert post(rest, f"question {i}").status_code == 200
+    limited = post(rest, "one more")
+    assert limited.status_code == 429 and int(limited.headers["Retry-After"]) > 0
+    assert len(rest.llm.requests) == 10  # the refused question never reached the model
+    rest.who["customer"] = GRACE
+    assert post(rest, "Grace's question").status_code == 200
+
+
+def test_websocket_questions_are_rate_limited_and_the_socket_stays_open(ws, env):
+    for i in range(10):
+        assert ask(ws, f"question {i}")["type"] == "answer"
+    ws.send_json({"type": "message", "question": "one more"})
+    frame = ws.receive_json()
+    assert frame["type"] == "error" and frame["code"] == "rate_limited"
+    ws.send_json({"type": "ping"})
+    assert ws.receive_json() == {"type": "pong"}
+    assert len(env.llm.requests) == 10
+
+
+def test_too_many_open_websockets_from_one_address_are_refused(env):
+    from starlette.websockets import WebSocketDisconnect
+
+    sockets = [env.client.websocket_connect("/ws/chat") for _ in range(5)]
+    opened = [s.__enter__() for s in sockets]
+    try:
+        for s in opened:
+            assert s.receive_json()["type"] == "ready"
+        with pytest.raises(WebSocketDisconnect):
+            with env.client.websocket_connect("/ws/chat") as extra:
+                extra.receive_json()
+    finally:
+        for s in sockets:
+            s.__exit__(None, None, None)
+    with env.client.websocket_connect("/ws/chat") as again:  # freed once they close
+        assert again.receive_json()["type"] == "ready"

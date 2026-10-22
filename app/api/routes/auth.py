@@ -17,9 +17,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, 
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_customer, get_session
+from app.api.deps import client_ip, get_current_customer, get_session
 from app.schemas.auth import CustomerProfile, RefreshRequest, RegisterRequest, TokenResponse
-from app.services import sessions
+from app.services import rate_limit, sessions
 from app.services.auth import create_access_token, hash_password, verify_password
 from app.services.errors import UnauthorizedError
 
@@ -58,6 +58,9 @@ def _refresh_token(request: Request, payload: RefreshRequest | None) -> str | No
     "/register", response_model=CustomerProfile, status_code=status.HTTP_201_CREATED
 )
 def register(payload: RegisterRequest, request: Request) -> CustomerProfile:
+    rate_limit.take(
+        [(rate_limit.REGISTER_PER_IP, client_ip(request))], "Too many accounts created from here."
+    )
     customer = request.app.state.db.create_customer(
         name=payload.name,
         email=payload.email,
@@ -81,15 +84,22 @@ def login(
     """OAuth2 password flow: send form fields `username` (your email) and
     `password`. Using the standard form is what makes the Authorize button
     in Swagger UI work. Starts a new sign-in session."""
-    record = request.app.state.db.get_customer_auth_record(
-        form.username.strip().lower()
+    email = form.username.strip().lower()
+    rate_limit.take([(rate_limit.LOGIN_PER_IP, client_ip(request))], "Too many sign-in attempts.")
+    # Counted per email whether or not it is registered, so a lock-out
+    # reveals nothing about which emails have accounts.
+    rate_limit.check(
+        [(rate_limit.LOGIN_FAILURES_PER_EMAIL, email)],
+        "Too many failed sign-in attempts for this account.",
     )
+    record = request.app.state.db.get_customer_auth_record(email)
     password_hash = record["password_hash"] if record else None
 
     # verify_password does equivalent work for unknown users, and the
     # message is identical for every failure, so neither timing nor the
     # error text reveals whether an email is registered.
     if not verify_password(form.password, password_hash):
+        rate_limit.LOGIN_FAILURES_PER_EMAIL.hit(email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -112,6 +122,7 @@ def refresh(
     the body or the cookie. The one sent is used up: send it again and you
     get 401 -- and, after a short grace period, the whole session is signed
     out, because a reused token means someone else may have a copy."""
+    rate_limit.take([(rate_limit.REFRESH_PER_IP, client_ip(request))], "Too many token refreshes.")
     token = _refresh_token(request, payload)
     if not token:
         raise UnauthorizedError(sessions.INVALID_REFRESH)

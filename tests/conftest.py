@@ -7,6 +7,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db.session import sqlalchemy_url
+from app.services import rate_limit
+
+
+@pytest.fixture(autouse=True)
+def fresh_rate_limits():
+    """Rate-limit counters are per process; start every test from zero."""
+    rate_limit.reset_all()
+    yield
+    rate_limit.reset_all()
 
 
 @pytest.fixture

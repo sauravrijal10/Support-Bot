@@ -23,7 +23,7 @@ from app.api.routes import auth as auth_routes
 from app.config import get_settings
 from app.main import domain_error_handler
 from app.models import AuthSession, Customer, RefreshToken
-from app.services import sessions
+from app.services import rate_limit, sessions
 from app.services.auth import ALGORITHM, create_access_token, decode_access_token, hash_password
 from app.services.errors import DomainError, UnauthorizedError
 
@@ -254,3 +254,26 @@ def test_logout_everywhere(client):
 def test_refresh_needs_a_token_and_rejects_unknown_fields(client):
     assert client.post("/auth/refresh").status_code == 401
     assert client.post("/auth/refresh", json={"refresh_token": "x", "customer_id": 1}).status_code == 422
+
+
+def test_repeated_failed_sign_ins_lock_that_email_for_a_while(client):
+    for _ in range(10):
+        bad = client.post("/auth/login", data={"username": "session-ada@example.test", "password": "wrong-pass"})
+        assert bad.status_code == 401
+    locked = client.post("/auth/login", data={"username": "session-ada@example.test", "password": "ada-password"})
+    assert locked.status_code == 429 and "Retry-After" in locked.headers  # even the right password waits
+    # Any email is limited the same way, so a lock-out says nothing about who is registered.
+    rate_limit.LOGIN_PER_IP.reset()  # so only the per-email rule is in play below
+    for _ in range(10):
+        client.post("/auth/login", data={"username": "nobody@example.test", "password": "wrong-pass"})
+    assert client.post("/auth/login", data={"username": "nobody@example.test", "password": "x" * 8}).status_code == 429
+
+
+def test_sign_in_attempts_are_limited_per_address(client):
+    for _ in range(20):
+        client.post("/auth/login", data={"username": "someone@example.test", "password": "wrong-pass"})
+    assert login_status(client) == 429
+
+
+def login_status(client):
+    return client.post("/auth/login", data={"username": "session-ada@example.test", "password": "ada-password"}).status_code

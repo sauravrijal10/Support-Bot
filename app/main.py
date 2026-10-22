@@ -23,7 +23,7 @@ from app.api.views.orders import OrderView
 from app.api.views.product_types import ProductTypeView
 from app.api.views.products import ProductView
 from app.api.views.tickets import TicketView
-from app.config import get_settings
+from app.config import docs_enabled, get_settings
 from app.db.migrate import run_migrations
 from app.db.session import create_session_factory
 from app.services.database import Database
@@ -56,7 +56,15 @@ async def lifespan(app: FastAPI):
     engine.dispose()
 
 
-app = FastAPI(title="Support Bot API", lifespan=lifespan)
+# ENABLE_DOCS=false in production hides the interactive API docs.
+_docs = docs_enabled()
+app = FastAPI(
+    title="Support Bot API",
+    lifespan=lifespan,
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
+)
 
 
 @app.exception_handler(DomainError)

@@ -26,6 +26,9 @@ services:
 
   app:
     build: .
+    # Development: reload on code changes (the Dockerfile's own command is
+    # the production one, used by Render).
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       db:
         condition: service_healthy

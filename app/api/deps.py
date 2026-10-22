@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
+from starlette.requests import HTTPConnection
+
+from app.config import trust_proxy
 
 from app.services.auth import decode_access_token
 
@@ -25,6 +28,23 @@ def _unauthorized(detail: str) -> HTTPException:
         detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def client_ip(conn: HTTPConnection) -> str:
+    """The caller's IP, for rate limits (works for requests and WebSockets).
+    Behind the proxy (TRUST_PROXY) it is the LAST X-Forwarded-For entry --
+    the one the proxy itself appended. Earlier entries come from the client
+    and can be anything, so they are never trusted."""
+    if trust_proxy():
+        hops = [h.strip() for h in conn.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+        if hops:
+            return hops[-1]
+    return conn.client.host if conn.client else "unknown"
+
+
+def chat_client_key(customer: dict | None, ip: str) -> str:
+    """Whose chat allowance a question counts against."""
+    return f"customer:{customer['id']}" if customer else f"ip:{ip}"
 
 
 def customer_from_token(db, token: str) -> dict | None:

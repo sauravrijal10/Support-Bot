@@ -221,6 +221,54 @@ docker compose exec db psql -U supportbot -d supportbot
    uvicorn app.main:app --reload
    ```
 
+## Deploying to Render
+
+`render.yaml` is a Render Blueprint: a Docker web service plus a Postgres
+database (Render's Postgres supports pgvector).
+
+1. Push the repo to GitHub. In Render: **New -> Blueprint**, pick the repo.
+2. Fill in the secrets it asks for: `HF_TOKEN` (required, even if out of
+   credit), `GROQ_API_KEY`, `GEMINI_API_KEY`. `JWT_SECRET` is generated, and
+   `DATABASE_URL` comes from the database. Use **new** keys, not your local ones.
+3. Deploy. On first start the app creates the pgvector extension, runs every
+   migration and indexes `knowledge/`. Check `https://<service>.onrender.com/health`.
+4. Optional demo data, from your machine against the database's **External**
+   URL: `docker compose run --rm -e DATABASE_URL="<external url>?sslmode=require" app python seed_data.py`
+
+What the production setup does differently:
+- The `Dockerfile` command listens on `$PORT`, without `--reload`, and with
+  `--proxy-headers` so the app knows requests arrived over HTTPS (the refresh
+  cookie is then `Secure`). `docker-compose.yml` overrides it with `--reload`
+  for local development.
+- `TRUST_PROXY=true`: rate limits use the client IP that Render's proxy
+  appends to `X-Forwarded-For` -- only the last entry, since earlier ones are
+  client-supplied and could be faked.
+- `ENABLE_DOCS=false`: `/docs`, `/redoc` and `/openapi.json` are hidden.
+
+Run **one** instance: rate-limit counters and WebSocket conversations live in
+memory, and migrations run at startup. The 512 MB instance types may be tight
+for the embedding model plus LangChain; if Render restarts the service for
+memory, pick a bigger one. Free instances sleep when idle (slow first request),
+and free databases expire.
+
+## Rate limits
+
+`app/services/rate_limit.py`, in memory. Over a limit, REST gets `429` with
+`Retry-After`; the WebSocket gets an `{"type": "error", "code": "rate_limited"}`
+frame and stays open.
+
+| What | Limit |
+|---|---|
+| Chat questions (REST + WebSocket) | 10 / minute and 200 / day per customer (per IP when signed out); 60 / minute overall |
+| Sign-in attempts | 20 / 10 minutes per IP |
+| Failed sign-ins | 10 / 15 minutes per email (registered or not) |
+| Registrations | 5 / hour per IP |
+| Token refreshes | 60 / minute per IP |
+| Open WebSockets | 5 at a time per IP |
+
+The overall chat cap is what bounds LLM spend even against someone rotating
+IP addresses.
+
 ## The API
 
 ### Authentication

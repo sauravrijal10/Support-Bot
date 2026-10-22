@@ -30,6 +30,18 @@ FALLBACK_PROVIDERS = {
 }
 
 
+def trust_proxy() -> bool:
+    """TRUST_PROXY=true when the app runs behind exactly one reverse proxy
+    that appends the client's address to X-Forwarded-For (e.g. Render). Read
+    on its own, without the secrets get_settings() insists on."""
+    return os.environ.get("TRUST_PROXY", "").strip().lower() in {"1", "true", "yes"}
+
+
+def docs_enabled() -> bool:
+    """ENABLE_DOCS=false hides /docs, /redoc and /openapi.json (production)."""
+    return os.environ.get("ENABLE_DOCS", "true").strip().lower() not in {"0", "false", "no"}
+
+
 @dataclass(frozen=True)
 class FallbackLLM:
     name: str

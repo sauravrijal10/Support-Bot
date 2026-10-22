@@ -11,7 +11,8 @@ def sqlalchemy_url(database_url: str) -> URL:
     passes it straight to psycopg2.connect(), which rejects "+psycopg2".
     """
     url = make_url(database_url)
-    if url.drivername == "postgresql":
+    # Some hosts hand out "postgres://", which SQLAlchemy doesn't accept.
+    if url.drivername in ("postgresql", "postgres"):
         url = url.set(drivername="postgresql+psycopg2")
     return url
 

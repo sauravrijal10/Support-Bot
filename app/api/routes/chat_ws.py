@@ -5,11 +5,12 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import customer_from_token
+from app.api.deps import chat_client_key, client_ip, customer_from_token
 from app.schemas.auth import CustomerProfile
 from app.schemas.chat import ChatResponse, WSAuth, WSClientFrame, WSMessage, WSPing, WSReset
 from app.services.chat_service import MAX_HISTORY_TURNS, answer_question, save_turn
-from app.services.errors import DomainError
+from app.services import rate_limit
+from app.services.errors import DomainError, TooManyRequestsError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class Conversation:
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
         self.state = websocket.app.state
+        self.ip = client_ip(websocket)
         self.token: str | None = None
         self.customer: dict | None = None
         self.history: list[dict] = []
@@ -83,6 +85,12 @@ class Conversation:
                 await self.send("auth_ok", customer=None, conversation_id=None)
                 return
             self.customer = customer
+
+        try:
+            rate_limit.take_chat(chat_client_key(self.customer, self.ip))
+        except TooManyRequestsError as error:
+            await self.error("rate_limited", error.detail)
+            return
 
         await self.send("typing")
         loop = asyncio.get_running_loop()
@@ -150,6 +158,18 @@ class Conversation:
 
 @router.websocket("/ws/chat")
 async def chat_socket(websocket: WebSocket) -> None:
+    ip = client_ip(websocket)
+    if not rate_limit.WEBSOCKETS_PER_IP.acquire(ip):
+        # 1013 "try again later": too many open chats from this address.
+        await websocket.close(code=1013)
+        return
+    try:
+        await _converse(websocket)
+    finally:
+        rate_limit.WEBSOCKETS_PER_IP.release(ip)
+
+
+async def _converse(websocket: WebSocket) -> None:
     await websocket.accept()
     conversation = Conversation(websocket)
     await conversation.send("ready", customer=None)

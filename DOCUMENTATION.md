@@ -397,6 +397,11 @@ docker compose run --rm app sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ---
 
+### 9.1 Deployment (Render) and rate limits
+- `render.yaml` Blueprint: Docker web service + Postgres. `Dockerfile` command is the production one (`$PORT`, no `--reload`, `--proxy-headers`); compose overrides it with `--reload`. `postgres://` URLs are accepted (`db/session.py`).
+- `TRUST_PROXY=true` on Render: `deps.client_ip` takes the **last** `X-Forwarded-For` entry (the proxy's); uvicorn's own `--forwarded-allow-ips='*'` would trust the first, client-controlled one, so it isn't used for IPs. `ENABLE_DOCS=false` hides `/docs`.
+- `services/rate_limit.py`: sliding-window limits in memory (one instance) -- chat 10/min + 200/day per client and 60/min overall; sign-in 20/10 min per IP and 10 failures/15 min per email; registration 5/hour per IP; refresh 60/min per IP; 5 open WebSockets per IP. 429 + `Retry-After` over REST, a `rate_limited` frame over the WebSocket.
+
 ## 10. Testing Performed
 
 ### 10.1 Automated — 203 tests
